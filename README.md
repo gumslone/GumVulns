@@ -146,6 +146,7 @@ understands:
 | NVD | `virtualMatchString=cpe:2.3:…` |
 | Shodan CVEDB | `cpe23=…` (with version) or `product=…` |
 | EUVD | `product=` / `vendor=` |
+| CIRCL | `/api/search/<vendor>/<product>` (needs both) |
 | Red Hat | `cve.json?product=<product>` |
 | Ubuntu | `cves.json?package=<product>` |
 | GitHub Advisory | `affects=<package>` (+ `ecosystem=` from a purl's type) |
@@ -153,10 +154,11 @@ understands:
 | OSV.dev | the purl / package (purl mode) or commit (GitHub commit) |
 
 **Phase 2 — cross-reference.** The CVEs discovered in phase 1 are then looked up
-in the sources that only answer by CVE id: **CISA KEV** (one feed download),
-**FIRST EPSS** (one batched request), **CIRCL**, **OSV**, **VulnCheck**, **CVE
-Details**. Everything is merged by CVE id, so each row lists every contributing
-source. Disable phase 2 with `--no-enrich`.
+in any source that didn't already run and only answers by CVE id: **CISA KEV**
+(one feed download), **FIRST EPSS** (one batched request), **OSV**, **VulnCheck**,
+**CVE Details**, and **CIRCL** (when the vendor was unknown). Everything is merged
+by CVE id, so each row lists every contributing source. Disable phase 2 with
+`--no-enrich`.
 
 > Phase 2 multiplies requests (one per CVE for the non-batch sources), so it
 > benefits from `GITHUB_TOKEN` / `NVD_API_KEY`. It runs on the results actually
@@ -265,7 +267,7 @@ parenthesized vectors). CVSS v4 vectors are surfaced but not yet scored.
 | Source | API key | CVE lookup | Keyword | CPE | Commit |
 |---|---|---|---|---|---|
 | NVD (NIST) | optional `NVD_API_KEY` | ✅ | ✅ | ✅ | — |
-| CIRCL CVE Search | — | ✅ | — | phase 2 | — |
+| CIRCL CVE Search | — | ✅ | — | ✅ (vendor/product) | — |
 | Red Hat Security Data | — | ✅ | — | ✅ (product) | — |
 | Shodan CVEDB | — | ✅ | — | ✅ | — |
 | Ubuntu Security | — | ✅ | — | ✅ (package) | — |

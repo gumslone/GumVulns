@@ -1022,7 +1022,7 @@ final class NvdSource extends VulnSource
     }
 }
 
-/** CIRCL CVE Search — CVE id (single) and CPE (cvefor, best-effort). */
+/** CIRCL CVE Search — CVE id (single) and CPE (vendor/product search). */
 final class CirclSource extends VulnSource
 {
     public function id(): string   { return 'circl'; }
@@ -1030,14 +1030,20 @@ final class CirclSource extends VulnSource
 
     public function buildRequest(Query $q): ?HttpRequest
     {
-        if ($q->type !== QueryType::CveId) {
-            return null; // The new CIRCL API has no CPE (cvefor) endpoint.
+        $h = ['Accept: application/json'];
+        if ($q->type === QueryType::CveId) {
+            return new HttpRequest('https://cve.circl.lu/api/cve/' . rawurlencode(strtoupper($q->raw)), 'GET', $h);
         }
-        return new HttpRequest(
-            'https://cve.circl.lu/api/cve/' . rawurlencode(strtoupper($q->raw)),
-            'GET',
-            ['Accept: application/json']
-        );
+        // CPE -> vendor/product search (needs both).
+        if ($q->type === QueryType::Cpe && $q->cpe
+            && $q->cpe->vendor !== '*' && $q->cpe->product !== '*') {
+            return new HttpRequest(
+                'https://cve.circl.lu/api/search/' . rawurlencode(strtolower($q->cpe->vendor))
+                    . '/' . rawurlencode(strtolower($q->cpe->product)),
+                'GET', $h
+            );
+        }
+        return null;
     }
 
     public function parse(HttpResponse $resp, Query $q): array
@@ -1049,14 +1055,24 @@ final class CirclSource extends VulnSource
         if (!$data) {
             return [];
         }
+        // Vendor/product search: { results: { <feed>: [ [id, record], ... ] } }.
         if ($q->type === QueryType::Cpe) {
             $out = [];
-            foreach ($data as $rec) {
-                if (is_array($rec)) {
-                    $out[] = $this->mapLegacy($rec);
+            foreach ($this->get($data, 'results', []) ?? [] as $bucket) {
+                if (!is_array($bucket)) {
+                    continue;
+                }
+                foreach ($bucket as $pair) {
+                    $record = is_array($pair) ? ($pair[1] ?? null) : null;
+                    if (is_array($record)) {
+                        $v = $this->mapRecord($record, is_array($pair) ? (string) ($pair[0] ?? '') : '');
+                        if ($v) {
+                            $out[] = $v;
+                        }
+                    }
                 }
             }
-            return array_filter($out);
+            return $out;
         }
         $v = $this->mapRecord($data, strtoupper($q->raw));
         return $v ? [$v] : [];
@@ -1080,19 +1096,6 @@ final class CirclSource extends VulnSource
         }
         [$score, $severity, $vector] = $this->metrics($cna, $data);
         return new Vulnerability((string) $id, $desc, $score, $severity, $vector, $this->name());
-    }
-
-    /** Legacy flat CVE object (cvefor returns these). */
-    private function mapLegacy(array $rec): ?Vulnerability
-    {
-        $id = (string) ($rec['id'] ?? '');
-        if ($id === '') {
-            return null;
-        }
-        $score  = $this->toFloat($rec['cvss'] ?? null);
-        $vector = (string) ($rec['cvss-vector'] ?? '');
-        $desc   = (string) ($rec['summary'] ?? '');
-        return new Vulnerability($id, $desc, $score, '', $vector, $this->name());
     }
 
     private function metrics(array $cna, array $root): array

@@ -285,6 +285,23 @@ $out = $epss->parse(resp(json_encode(['data' => [
 eq(count($out), 2, 'epss parses multiple rows');
 eq($out[1]->cveId, 'CVE-2', 'epss row cve id');
 
+// CIRCL vendor/product search ({ results: { feed: [[id, record], ...] } })
+$circl = new CirclSource();
+$cq = new Query(QueryType::Cpe, 'x', Cpe::parse('apache:log4j'));
+$creq = $circl->buildRequest($cq);
+ok($creq !== null && str_contains($creq->url, '/api/search/apache/log4j'), 'circl builds vendor/product search url');
+$cJson = json_encode(['results' => ['nvd' => [
+    ['cve-2021-44228', ['cveMetadata' => ['cveId' => 'CVE-2021-44228'], 'containers' => ['cna' => [
+        'descriptions' => [['lang' => 'en', 'value' => 'Log4Shell']],
+        'metrics' => [['cvssV3_1' => ['baseScore' => 10.0, 'baseSeverity' => 'CRITICAL',
+            'vectorString' => 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H']]],
+    ]]]],
+]]]);
+$out = $circl->parse(resp($cJson), $cq);
+eq($out[0]->cveId, 'CVE-2021-44228', 'circl product search cve');
+eq($out[0]->score, 10.0, 'circl product search score');
+eq($circl->buildRequest(new Query(QueryType::Cpe, 'x', Cpe::parse('log4j'))), null, 'circl skips CPE search without vendor');
+
 // Red Hat product search (list of summary objects)
 $rh = new RedHatSource();
 $rhJson = json_encode([
