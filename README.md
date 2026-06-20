@@ -146,7 +146,7 @@ understands:
 | NVD | `virtualMatchString=cpe:2.3:…` |
 | Shodan CVEDB | `cpe23=…` (with version) or `product=…` |
 | EUVD | `product=` / `vendor=` |
-| CIRCL | `/api/search/<vendor>/<product>` (needs both) |
+| CIRCL | `/api/vulnerability/cpesearch/<cpe2.3>` (needs a concrete vendor) |
 | Red Hat | `cve.json?product=<product>` |
 | Ubuntu | `cves.json?package=<product>` |
 | GitHub Advisory | `affects=<package>` (+ `ecosystem=` from a purl's type) |

@@ -1034,12 +1034,11 @@ final class CirclSource extends VulnSource
         if ($q->type === QueryType::CveId) {
             return new HttpRequest('https://cve.circl.lu/api/cve/' . rawurlencode(strtoupper($q->raw)), 'GET', $h);
         }
-        // CPE -> vendor/product search (needs both).
-        if ($q->type === QueryType::Cpe && $q->cpe
-            && $q->cpe->vendor !== '*' && $q->cpe->product !== '*') {
+        // CPE -> dedicated CPE search (needs a concrete vendor; wildcard returns {}).
+        if ($q->type === QueryType::Cpe && $q->cpe && $q->cpe->vendor !== '*' && $q->cpe->product !== '*') {
             return new HttpRequest(
-                'https://cve.circl.lu/api/search/' . rawurlencode(strtolower($q->cpe->vendor))
-                    . '/' . rawurlencode(strtolower($q->cpe->product)),
+                'https://cve.circl.lu/api/vulnerability/cpesearch/' . rawurlencode($q->cpe->toQueryCpe23())
+                    . '?per_page=50&page=1&source=cvelistv5',
                 'GET', $h
             );
         }
@@ -1055,18 +1054,23 @@ final class CirclSource extends VulnSource
         if (!$data) {
             return [];
         }
-        // Vendor/product search: { results: { <feed>: [ [id, record], ... ] } }.
+        // CPE search: { <feed>: [ <CVE 5.0 record>, ... ] } (also tolerate the
+        // legacy { results: { <feed>: [[id, record], ...] } } shape).
         if ($q->type === QueryType::Cpe) {
+            $buckets = isset($data['results']) && is_array($data['results']) ? $data['results'] : $data;
             $out = [];
-            foreach ($this->get($data, 'results', []) ?? [] as $bucket) {
+            foreach ($buckets as $bucket) {
                 if (!is_array($bucket)) {
                     continue;
                 }
-                foreach ($bucket as $pair) {
-                    $record = is_array($pair) ? ($pair[1] ?? null) : null;
+                foreach ($bucket as $item) {
+                    // Either a record directly, or an [id, record] pair.
+                    $record = (is_array($item) && (isset($item['containers']) || isset($item['cveMetadata'])))
+                        ? $item
+                        : (is_array($item) ? ($item[1] ?? null) : null);
                     if (is_array($record)) {
-                        $v = $this->mapRecord($record, is_array($pair) ? (string) ($pair[0] ?? '') : '');
-                        if ($v) {
+                        $v = $this->mapRecord($record, '');
+                        if ($v && $v->cveId !== 'N/A') {
                             $out[] = $v;
                         }
                     }

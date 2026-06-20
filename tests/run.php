@@ -289,17 +289,19 @@ eq($out[1]->cveId, 'CVE-2', 'epss row cve id');
 $circl = new CirclSource();
 $cq = new Query(QueryType::Cpe, 'x', Cpe::parse('apache:log4j'));
 $creq = $circl->buildRequest($cq);
-ok($creq !== null && str_contains($creq->url, '/api/search/apache/log4j'), 'circl builds vendor/product search url');
-$cJson = json_encode(['results' => ['nvd' => [
-    ['cve-2021-44228', ['cveMetadata' => ['cveId' => 'CVE-2021-44228'], 'containers' => ['cna' => [
-        'descriptions' => [['lang' => 'en', 'value' => 'Log4Shell']],
-        'metrics' => [['cvssV3_1' => ['baseScore' => 10.0, 'baseSeverity' => 'CRITICAL',
-            'vectorString' => 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H']]],
-    ]]]],
-]]]);
-$out = $circl->parse(resp($cJson), $cq);
-eq($out[0]->cveId, 'CVE-2021-44228', 'circl product search cve');
-eq($out[0]->score, 10.0, 'circl product search score');
+ok($creq !== null && str_contains(rawurldecode($creq->url), '/api/vulnerability/cpesearch/cpe:2.3:a:apache:log4j'),
+    'circl builds cpesearch url');
+$record = ['cveMetadata' => ['cveId' => 'CVE-2021-44228'], 'containers' => ['cna' => [
+    'descriptions' => [['lang' => 'en', 'value' => 'Log4Shell']],
+    'metrics' => [['cvssV3_1' => ['baseScore' => 10.0, 'baseSeverity' => 'CRITICAL',
+        'vectorString' => 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H']]],
+]]];
+$out = $circl->parse(resp(json_encode(['cvelistv5' => [$record]])), $cq);
+eq($out[0]->cveId, 'CVE-2021-44228', 'circl cpesearch cve');
+eq($out[0]->score, 10.0, 'circl cpesearch score');
+// legacy { results: { feed: [[id, record]] } } shape still parses
+$out = $circl->parse(resp(json_encode(['results' => ['nvd' => [['cve-2021-44228', $record]]]])), $cq);
+eq($out[0]->cveId, 'CVE-2021-44228', 'circl legacy results shape');
 eq($circl->buildRequest(new Query(QueryType::Cpe, 'x', Cpe::parse('log4j'))), null, 'circl skips CPE search without vendor');
 
 // Red Hat product search (list of summary objects)
