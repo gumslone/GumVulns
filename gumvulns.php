@@ -752,7 +752,8 @@ final class HttpRequest
     /** @var array<int,string> */
     public array $headers;
     public ?string $body;
-    public int $timeout = 0; // per-request override; 0 = use the batch default
+    public int $timeout = 0;  // per-request override; 0 = use the batch default
+    public int $cacheTtl = 0; // cache the response this many seconds; 0 = no cache
 
     /** @param array<int,string> $headers */
     public function __construct(string $url, string $method = 'GET', array $headers = [], ?string $body = null)
@@ -787,12 +788,36 @@ final class HttpResponse
 /** Performs many HTTP requests concurrently with curl_multi. */
 final class Http
 {
+    public static bool $cacheEnabled = true;
+
+    /** On-disk cache path for a (method,url,body) tuple. */
+    public static function cachePath(HttpRequest $req): string
+    {
+        return gumvulns_cache_dir() . '/http_' . sha1($req->method . ' ' . $req->url . ' ' . ($req->body ?? '')) . '.cache';
+    }
+
     /**
      * @param array<string,HttpRequest> $requests keyed by an arbitrary id
      * @return array<string,HttpResponse> same keys
      */
     public static function parallel(array $requests, int $timeout = 30): array
     {
+        $responses = [];
+
+        // Serve fresh cached responses without touching the network.
+        foreach ($requests as $id => $req) {
+            if (self::$cacheEnabled && $req->cacheTtl > 0) {
+                $cf = self::cachePath($req);
+                if (gumvulns_cache_fresh($cf, $req->cacheTtl)) {
+                    $responses[$id] = new HttpResponse(200, (string) file_get_contents($cf), '');
+                    unset($requests[$id]);
+                }
+            }
+        }
+        if (!$requests) {
+            return $responses;
+        }
+
         $mh      = curl_multi_init();
         $handles = [];
 
@@ -847,12 +872,16 @@ final class Http
             }
         }
 
-        $responses = [];
         foreach ($handles as $id => $ch) {
             $err  = curl_error($ch) ?: ($errors[spl_object_id($ch)] ?? '');
             $body = (string) curl_multi_getcontent($ch);
             $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $responses[$id] = new HttpResponse($code, $body, $err);
+            $resp = new HttpResponse($code, $body, $err);
+            // Cache successful responses for sources that asked for it.
+            if (self::$cacheEnabled && $requests[$id]->cacheTtl > 0 && $resp->ok() && $body !== '') {
+                @file_put_contents(self::cachePath($requests[$id]), $body);
+            }
+            $responses[$id] = $resp;
             curl_multi_remove_handle($mh, $ch);
             curl_close($ch);
         }
@@ -1019,8 +1048,9 @@ final class NvdSource extends VulnSource
             $headers[] = 'apiKey: ' . $k;
         }
         $req = new HttpRequest($url, 'GET', $headers);
-        // Keyless NVD is heavily throttled and slow; give it more room.
-        $req->timeout = $hasKey ? 25 : 55;
+        // Keyless NVD is heavily throttled and slow; give it more room and cache.
+        $req->timeout  = $hasKey ? 25 : 55;
+        $req->cacheTtl = 21600; // 6h
         return $req;
     }
 
@@ -2156,7 +2186,10 @@ final class Aggregator
         if ($key !== false && $key !== '') {
             $headers[] = 'apiKey: ' . $key;
         }
-        return new HttpRequest($url, 'GET', $headers);
+        $req = new HttpRequest($url, 'GET', $headers);
+        $req->timeout  = 25;
+        $req->cacheTtl = 21600; // 6h
+        return $req;
     }
 }
 
@@ -2912,6 +2945,8 @@ function gumvulns_main(array $argv): int
             $osvSpec = substr($arg, 14);
         } elseif ($arg === '--no-cpe-resolve') {
             $noCpeResolve = true;
+        } elseif ($arg === '--no-cache') {
+            Http::$cacheEnabled = false;
         } elseif (str_starts_with($arg, '--timeout=')) {
             $timeout = max(5, (int) substr($arg, 10));
         } elseif ($arg === '--list-sources') {
@@ -3111,6 +3146,7 @@ Options:
   --no-cpe-resolve    For purl queries, don't resolve the package name to a
                       vendor:product via the NVD CPE dictionary.
   --timeout=SECONDS   Per-request network timeout (default 30; NVD gets longer).
+  --no-cache          Don't use the on-disk response cache (NVD is cached 6h).
   --list-sources      List sources and whether they are enabled.
   -h, --help          Show this help.
 

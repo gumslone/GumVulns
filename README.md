@@ -305,6 +305,10 @@ gives NVD a longer per-request timeout and skips the secondary CPE-title lookup
 the diagnostics footer will say so and point you to the free key. The general
 per-request network timeout is `--timeout=SECONDS` (default 30).
 
+**NVD responses are cached** on disk under `~/.cache/gumvulns` for 6 hours, so a
+repeated query returns instantly instead of re-hitting NVD (in testing: a cold
+keyless call took ~34s, the cached call ~0.1s). Use `--no-cache` to bypass it.
+
 ### EUVD (ENISA) and CVE Details
 
 - **EUVD** uses the ENISA EU Vulnerability Database JSON search API

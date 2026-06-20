@@ -388,6 +388,25 @@ $ordered = Merger::orderForCpe([$hi, $lo]);
 eq($ordered[0]->cveId, 'CVE-LO', 'order: confirmed-vulnerable first');
 
 /* -------------------------------------------------------------------------- */
+section('HTTP cache');
+
+// A fresh cache file is served without hitting the network.
+$creq2 = new HttpRequest('https://example.invalid/cache-test', 'GET');
+$creq2->cacheTtl = 3600;
+@file_put_contents(Http::cachePath($creq2), 'CACHED-BODY');
+$cres = Http::parallel(['k' => $creq2])['k'];
+eq($cres->body, 'CACHED-BODY', 'cache hit served without network');
+eq($cres->status, 200, 'cache hit status 200');
+@unlink(Http::cachePath($creq2));
+// --no-cache bypasses the cache (would hit network -> we just confirm it ignores the file).
+@file_put_contents(Http::cachePath($creq2), 'CACHED-BODY');
+Http::$cacheEnabled = false;
+$cres = Http::parallel(['k' => $creq2])['k'];
+ok($cres->body !== 'CACHED-BODY', 'no-cache bypasses cache file');
+Http::$cacheEnabled = true;
+@unlink(Http::cachePath($creq2));
+
+/* -------------------------------------------------------------------------- */
 section('Vulnerability helpers');
 
 eq(Vulnerability::severityFromScore(10.0), 'CRITICAL', 'severity 10 -> critical');
