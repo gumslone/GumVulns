@@ -28,6 +28,11 @@ php gumvulns.php "cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*"
 php gumvulns.php --cpe apache:log4j
 php gumvulns.php --cpe a:openbsd:openssh:9.1 --limit=20
 
+# Package URL (purl) — queried natively via OSV.dev
+php gumvulns.php "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1"
+php gumvulns.php "pkg:npm/lodash@4.17.20"
+php gumvulns.php "pkg:pypi/django@3.2"
+
 # common options
 php gumvulns.php CVE-2021-44228 --json
 php gumvulns.php CVE-2021-44228 --source=nvd,redhat
@@ -74,6 +79,24 @@ coordinates) or a purl. The version defaults to the CPE version when one is
 given, so OSV returns exactly the advisories affecting that version — these merge
 into the CPE results by CVE id and are flagged **VULNERABLE** via OSV's version
 ranges.
+
+### Package URL (purl) mode
+
+Pass a [purl](https://github.com/package-url/purl-spec) and GumVulns queries
+**OSV.dev natively** (OSV understands purls directly, including the version), so
+you get exactly the advisories affecting that package version — each flagged
+**VULNERABLE** via OSV's version ranges:
+
+```bash
+php gumvulns.php "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1"
+php gumvulns.php "pkg:npm/lodash@4.17.20"
+php gumvulns.php "pkg:pypi/django@3.2"
+```
+
+The purl's `name` and `version` are also used to query the CPE-capable sources
+(NVD, Shodan, EUVD, Vulners) and to drive the exploit/PoC and EOL enrichment, all
+merged by CVE id. OSV is the authoritative matcher here; the CPE sources are
+best-effort (the purl name may not equal a vendor's CPE product string).
 
 ### GitHub link mode
 

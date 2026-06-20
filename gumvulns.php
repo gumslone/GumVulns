@@ -2351,6 +2351,18 @@ final class Renderer
         return str_replace("\n", "\n               ", wordwrap($text, $width, "\n", true));
     }
 
+    /** @param array{ecosystem:?string,name:?string,purl:?string,version:?string} $osv */
+    public static function osvInfo(array $osv): string
+    {
+        $pkg = $osv['purl'] ?? trim(($osv['ecosystem'] ?? '') . ':' . ($osv['name'] ?? ''), ':');
+        $out = "\nOSV package query\n" . self::RULE;
+        $out .= self::row('Package', $pkg !== '' ? $pkg : '—');
+        if (!empty($osv['version'])) {
+            $out .= self::row('Version', $osv['version']);
+        }
+        return $out . self::RULE;
+    }
+
     public static function githubInfo(GitHubRef $gh): string
     {
         $out = "\nGitHub source\n" . self::RULE;
@@ -2459,8 +2471,58 @@ function gumvulns_parse_osv_spec(string $spec, ?string $fallbackVersion): ?array
     ];
 }
 
+/**
+ * Parse a Package URL (purl): pkg:type/namespace.../name@version?quals#sub.
+ *
+ * @return array{type:string,namespace:?string,name:string,version:?string}|null
+ */
+function gumvulns_parse_purl(string $purl): ?array
+{
+    if (stripos($purl, 'pkg:') !== 0) {
+        return null;
+    }
+    $body = substr($purl, 4);
+    $body = explode('#', $body, 2)[0];   // drop subpath
+    $body = explode('?', $body, 2)[0];   // drop qualifiers
+
+    $pos = strpos($body, '/');
+    if ($pos === false) {
+        return null; // need at least type/name
+    }
+    $type = strtolower(substr($body, 0, $pos));
+    $rest = substr($body, $pos + 1);
+
+    $version = null;
+    if (($at = strrpos($rest, '@')) !== false) {
+        $version = rawurldecode(substr($rest, $at + 1));
+        $rest    = substr($rest, 0, $at);
+    }
+    $segments  = array_values(array_filter(explode('/', $rest), static fn ($s) => $s !== ''));
+    if (!$segments) {
+        return null;
+    }
+    $name      = rawurldecode((string) array_pop($segments));
+    $namespace = $segments ? rawurldecode(implode('/', $segments)) : null;
+
+    return ['type' => $type, 'namespace' => $namespace, 'name' => $name, 'version' => $version];
+}
+
 function gumvulns_parse_query(string $raw, bool $forceCpe): Query
 {
+    // Package URL (purl): OSV queries it natively; derive product/version so the
+    // CPE-capable sources, version flag and enrichment apply too.
+    if (stripos($raw, 'pkg:') === 0) {
+        $p = gumvulns_parse_purl($raw);
+        if ($p === null) {
+            fwrite(STDERR, "Could not parse purl (expected pkg:type/namespace/name@version).\n");
+            exit(1);
+        }
+        $cpe = Cpe::fromParts('', $p['name'], $p['version'] ?? '*');
+        $q   = new Query(QueryType::Cpe, $raw, $cpe);
+        $q->osv = ['ecosystem' => null, 'name' => null, 'purl' => $raw, 'version' => null];
+        return $q;
+    }
+
     // GitHub download/source link: extract commit (for OSV) and owner/repo/version (for CPE sources).
     if (preg_match('#^https?://#i', $raw)) {
         $gh = GitHubRef::parse($raw);
@@ -2635,6 +2697,9 @@ function gumvulns_main(array $argv): int
         if ($query->github) {
             $payload['github'] = $query->github->describe();
         }
+        if ($query->osv) {
+            $payload['osv'] = $query->osv;
+        }
         if ($eol !== null) {
             $payload['eol'] = $eol;
         }
@@ -2645,6 +2710,9 @@ function gumvulns_main(array $argv): int
     echo "\nQuery: {$query->raw}  [{$query->type->value}]\n";
     if ($query->github) {
         echo Renderer::githubInfo($query->github);
+    }
+    if ($query->osv) {
+        echo Renderer::osvInfo($query->osv);
     }
     if ($query->cpe) {
         echo Renderer::cpeInfo($query->cpe, $res['cpe_meta'], $eol);
@@ -2662,7 +2730,7 @@ function gumvulns_usage(): void
 GumVulns — multi-source vulnerability search
 
 Usage:
-  php gumvulns.php <CVE-ID | keywords | CPE | GitHub-URL> [options]
+  php gumvulns.php <CVE-ID | keywords | CPE | purl | GitHub-URL> [options]
 
 Options:
   --cpe               Treat input as a CPE / stub (vendor:product[:version]).
@@ -2688,6 +2756,11 @@ Examples:
   php gumvulns.php --cpe a:openbsd:openssh:9.1 --limit=20
   php gumvulns.php --cpe apache:log4j:2.14.1 \
       --osv-package=Maven:org.apache.logging.log4j:log4j-core
+
+Package URL (purl) — queried natively via OSV.dev:
+  php gumvulns.php "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1"
+  php gumvulns.php "pkg:npm/lodash@4.17.20"
+  php gumvulns.php "pkg:pypi/django@3.2"
 
 GitHub links (commit -> OSV.dev; owner/repo/tag -> CPE sources):
   php gumvulns.php https://github.com/jquery/jquery/archive/refs/tags/3.3.1.zip
