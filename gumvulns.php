@@ -57,6 +57,8 @@ final class Query
     /** @var array{ecosystem:?string,name:?string,purl:?string,version:?string}|null */
     public ?array $osv = null;     // explicit OSV package query (--osv-package)
     public bool $cpeResolved = false; // CPE vendor/product resolved from a purl
+    /** @var array{type:string,namespace:?string,name:string,version:?string}|null */
+    public ?array $purl = null;    // parsed purl, when the query was a purl
 
     public function __construct(
         QueryType $type,
@@ -2600,6 +2602,7 @@ function gumvulns_parse_query(string $raw, bool $forceCpe, bool $resolveCpe = tr
         $q = new Query(QueryType::Cpe, $raw, $cpe);
         $q->osv = ['ecosystem' => null, 'name' => null, 'purl' => $raw, 'version' => null];
         $q->cpeResolved = $resolved !== null;
+        $q->purl = $p;
         return $q;
     }
 
@@ -2780,6 +2783,9 @@ function gumvulns_main(array $argv): int
         }
         if ($query->github) {
             $payload['github'] = $query->github->describe();
+        }
+        if ($query->purl) {
+            $payload['purl'] = $query->purl;
         }
         if ($query->osv) {
             $payload['osv'] = $query->osv;

@@ -1,5 +1,7 @@
 # GumVulns
 
+[![CI](https://github.com/gumslone/GumVulns/actions/workflows/ci.yml/badge.svg)](https://github.com/gumslone/GumVulns/actions/workflows/ci.yml)
+
 A single-file PHP CLI that searches **many vulnerability APIs in parallel** and
 returns a normalized record for each hit: **CVE id, description, score, severity,
 vector, source**.
@@ -292,3 +294,14 @@ per source.
 Implement `VulnSource` (`id`, `name`, `buildRequest`, `parse`) and add an instance
 to `gumvulns_sources()`. The aggregator handles parallelism, timeouts, and
 error reporting for you.
+
+## Testing
+
+```bash
+php tests/run.php
+```
+
+The suite is dependency-free and fully **offline** — it includes `gumvulns.php`
+(its entry point is guarded) and exercises the parsing/scoring/merging logic plus
+every source's `parse()` against canned API responses, so no network is touched.
+CI (GitHub Actions) runs `php -l` and the suite on PHP 8.1–8.4.
