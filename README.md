@@ -39,7 +39,7 @@ $json = json_encode(gumvulns_payload($res)); // same shape as CLI --json
 ```
 
 Options mirror the CLI flags (`cpe`, `resolve_cpe`, `sources`, `limit`,
-`timeout`, `no_poc`, `no_enrich`, `no_cache`, `osv_package`).
+`timeout`, `no_poc`, `no_enrich`, `no_cache`, `osv_package`, `circl_url`).
 
 ## Usage
 
@@ -73,6 +73,24 @@ php gumvulns.php --list-sources
 php gumvulns.php --help
 ```
 
+### Options
+
+| Flag | Description |
+|---|---|
+| `--json` | Output JSON instead of the table. |
+| `--cpe` | Treat the input as a CPE / stub (`vendor:product[:version]`). |
+| `--source=a,b,c` | Only query the named sources (see `--list-sources`). |
+| `--limit=N` | Cap results (default 50 in CPE/purl/GitHub mode). |
+| `--timeout=SECONDS` | Per-request network timeout (default 30; NVD gets longer). |
+| `--no-poc` | Skip exploit/PoC enrichment (Nuclei, Exploit-DB, Metasploit, PoC-in-GitHub). |
+| `--no-enrich` | Skip phase-2 cross-referencing of discovered CVEs. |
+| `--no-cpe-resolve` | For purl queries, don't resolve the package name to a `vendor:product`. |
+| `--no-cache` | Bypass the on-disk response cache (NVD/indexes are cached). |
+| `--osv-package=SPEC` | Add an OSV package query (`ecosystem:name[@version]` or a purl). |
+| `--circl-url=URL` | Base URL of a self-hosted vulnerability-lookup API. |
+| `--list-sources` | List sources and whether they are enabled. |
+| `-h`, `--help` | Show help. |
+
 ### CPE mode
 
 Accepts a full **CPE 2.3** string (`cpe:2.3:a:vendor:product:version:...`), a
@@ -81,7 +99,9 @@ legacy **CPE 2.2 URI** (`cpe:/a:vendor:product:version`), or a bare **stub**
 
 It then:
 1. Parses the CPE into all 11 fields and prints the breakdown.
-2. Resolves the platform title from the **NVD CPE dictionary**.
+2. Resolves the platform title — from the **NVD CPE dictionary** when an
+   `NVD_API_KEY` is set, otherwise from **CIRCL's vendor catalog** (so it works
+   keyless without a second NVD call).
 3. Returns **every matching CVE** from all sources — directly from those that
    support product search (NVD, Shodan, EUVD, Red Hat, Ubuntu, GitHub, Vulners)
    and then by cross-referencing the discovered CVEs against the CVE-keyed ones
@@ -156,8 +176,8 @@ Then it searches:
 - **By commit** in **OSV.dev** (`/v1/query` with `{"commit": …}`) — OSV matches the
   hash against each advisory's git ranges. Short SHAs are resolved to the full
   hash via the GitHub API first (`GITHUB_TOKEN` raises the rate limit).
-- **By CPE** (`owner`→vendor, `repo`→product, `tag`→version) in the CPE-capable
-  sources (NVD, Shodan, Vulners).
+- **By CPE** (`owner`→vendor, `repo`→product, `tag`→version) across all the
+  product-search sources (see [Querying every source](#querying-every-source-cpe--purl--github)).
 
 Results from both paths are merged and deduplicated by CVE id.
 
@@ -320,8 +340,9 @@ a version is supplied its end-of-life status is pulled from endoflife.date. See
 [Exploit / PoC availability](#exploit--poc-availability) and
 [End-of-life status](#end-of-life-status) below.
 
-Nine sources work with **zero configuration**. The keyed sources auto-enable
-when their environment variable is set:
+Ten sources work with **zero configuration** (NVD and GitHub work keyless but are
+faster/less throttled with a key). The keyed sources auto-enable when their
+environment variable is set:
 
 ```bash
 export NVD_API_KEY=...        # strongly recommended — NVD throttles hard without it
@@ -382,9 +403,6 @@ Precedence: `circl_url` option / `--circl-url` > `VULNERABILITY_LOOKUP_URL` env 
   ```bash
   export CVEDETAILS_COOKIE='cf_clearance=...; ...'
   ```
-
-> **Note:** Without `NVD_API_KEY`, NVD requests are rate-limited and may time out.
-> Set the key for fast, reliable NVD results.
 
 ## Output
 
