@@ -57,8 +57,8 @@ final class Query
     /** @var array{ecosystem:?string,name:?string,purl:?string,version:?string}|null */
     public ?array $osv = null;     // explicit OSV package query (--osv-package)
     public bool $cpeResolved = false; // CPE vendor/product resolved from a purl
-    /** @var array{type:string,namespace:?string,name:string,version:?string}|null */
-    public ?array $purl = null;    // parsed purl, when the query was a purl
+    /** @var array{purl:string,type:string,namespace:?string,name:string,version:?string}|null */
+    public ?array $purl = null;    // full purl + parsed parts, when the query was a purl
 
     public function __construct(
         QueryType $type,
@@ -2476,11 +2476,13 @@ function gumvulns_parse_osv_spec(string $spec, ?string $fallbackVersion): ?array
 
 /**
  * Parse a Package URL (purl): pkg:type/namespace.../name@version?quals#sub.
+ * The full, unparsed purl is returned under "purl" alongside the components.
  *
- * @return array{type:string,namespace:?string,name:string,version:?string}|null
+ * @return array{purl:string,type:string,namespace:?string,name:string,version:?string}|null
  */
 function gumvulns_parse_purl(string $purl): ?array
 {
+    $purl = trim($purl);
     if (stripos($purl, 'pkg:') !== 0) {
         return null;
     }
@@ -2507,7 +2509,7 @@ function gumvulns_parse_purl(string $purl): ?array
     $name      = rawurldecode((string) array_pop($segments));
     $namespace = $segments ? rawurldecode(implode('/', $segments)) : null;
 
-    return ['type' => $type, 'namespace' => $namespace, 'name' => $name, 'version' => $version];
+    return ['purl' => $purl, 'type' => $type, 'namespace' => $namespace, 'name' => $name, 'version' => $version];
 }
 
 /** Fetch NVD CPE-dictionary entries for a keyword (cached 24h). */
