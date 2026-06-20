@@ -752,6 +752,7 @@ final class HttpRequest
     /** @var array<int,string> */
     public array $headers;
     public ?string $body;
+    public int $timeout = 0; // per-request override; 0 = use the batch default
 
     /** @param array<int,string> $headers */
     public function __construct(string $url, string $method = 'GET', array $headers = [], ?string $body = null)
@@ -810,7 +811,7 @@ final class Http
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_FOLLOWLOCATION => true,
                 CURLOPT_CONNECTTIMEOUT => 8,
-                CURLOPT_TIMEOUT        => $timeout,
+                CURLOPT_TIMEOUT        => $req->timeout > 0 ? $req->timeout : $timeout,
                 CURLOPT_ENCODING       => '',
                 CURLOPT_HTTPHEADER     => $req->headers,
                 CURLOPT_SSL_VERIFYPEER => true,
@@ -1013,11 +1014,14 @@ final class NvdSource extends VulnSource
         };
 
         $headers = ['Accept: application/json'];
-        $key = getenv('NVD_API_KEY');
-        if ($key !== false && $key !== '') {
-            $headers[] = 'apiKey: ' . $key;
+        $hasKey  = ($k = getenv('NVD_API_KEY')) !== false && $k !== '';
+        if ($hasKey) {
+            $headers[] = 'apiKey: ' . $k;
         }
-        return new HttpRequest($url, 'GET', $headers);
+        $req = new HttpRequest($url, 'GET', $headers);
+        // Keyless NVD is heavily throttled and slow; give it more room.
+        $req->timeout = $hasKey ? 25 : 55;
+        return $req;
     }
 
     public function parse(HttpResponse $resp, Query $q): array
@@ -2026,7 +2030,10 @@ final class Aggregator
             }
         }
 
-        if ($q->type === QueryType::Cpe && $q->cpe !== null) {
+        // The CPE-title lookup is a second NVD call; skip it without a key so it
+        // doesn't compete with the main NVD search (keyless NVD throttles hard).
+        $hasNvdKey = ($k = getenv('NVD_API_KEY')) !== false && $k !== '';
+        if ($q->type === QueryType::Cpe && $q->cpe !== null && $hasNvdKey) {
             $reqs['__cpe_meta'] = $this->cpeMetaRequest($q->cpe);
         }
 
@@ -2612,10 +2619,19 @@ final class Renderer
     /** @param array<int,array<string,mixed>> $diag */
     public static function diagnostics(array $diag): string
     {
+        $hasNvdKey = ($k = getenv('NVD_API_KEY')) !== false && $k !== '';
+        $nvdTrouble = false;
         $out = "\nSources queried:\n";
         foreach ($diag as $d) {
             $note = $d['error'] !== '' ? "ERROR ({$d['error']})" : "HTTP {$d['status']}, {$d['count']} result(s)";
             $out .= sprintf("  • %-20s %s\n", $d['source'], $note);
+            if (str_contains($d['source'], 'NVD') && $d['error'] !== '') {
+                $nvdTrouble = true;
+            }
+        }
+        if ($nvdTrouble && !$hasNvdKey) {
+            $out .= "\n  ! NVD is rate-limited without a key. Set NVD_API_KEY for fast, reliable NVD\n"
+                . "    results (free: https://nvd.nist.gov/developers/request-an-api-key).\n";
         }
         return $out;
     }
@@ -2880,6 +2896,7 @@ function gumvulns_main(array $argv): int
     $limit     = null;
     $osvSpec   = null;
     $noCpeResolve = false;
+    $timeout   = 30;
     $queryBits = [];
 
     foreach ($args as $arg) {
@@ -2895,6 +2912,8 @@ function gumvulns_main(array $argv): int
             $osvSpec = substr($arg, 14);
         } elseif ($arg === '--no-cpe-resolve') {
             $noCpeResolve = true;
+        } elseif (str_starts_with($arg, '--timeout=')) {
+            $timeout = max(5, (int) substr($arg, 10));
         } elseif ($arg === '--list-sources') {
             foreach (gumvulns_sources() as $s) {
                 printf("  %-12s %-22s (%s)\n", $s->id(), $s->name(), $s->isEnabled() ? 'enabled' : 'needs API key');
@@ -2940,7 +2959,7 @@ function gumvulns_main(array $argv): int
         }
     }
 
-    $agg     = new Aggregator($sources);
+    $agg     = new Aggregator($sources, $timeout);
     $res     = $agg->search($query);
     $results = $res['results'];
 
@@ -3091,6 +3110,7 @@ Options:
                       defaults to the CPE version when one is given.
   --no-cpe-resolve    For purl queries, don't resolve the package name to a
                       vendor:product via the NVD CPE dictionary.
+  --timeout=SECONDS   Per-request network timeout (default 30; NVD gets longer).
   --list-sources      List sources and whether they are enabled.
   -h, --help          Show this help.
 

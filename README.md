@@ -299,6 +299,12 @@ export VULNERS_API_KEY=...
 export VULNCHECK_API_KEY=...
 ```
 
+Without `NVD_API_KEY`, NVD's API is rate-limited and often slow, so GumVulns
+gives NVD a longer per-request timeout and skips the secondary CPE-title lookup
+(which would otherwise compete with the main NVD search). It may still time out —
+the diagnostics footer will say so and point you to the free key. The general
+per-request network timeout is `--timeout=SECONDS` (default 30).
+
 ### EUVD (ENISA) and CVE Details
 
 - **EUVD** uses the ENISA EU Vulnerability Database JSON search API
