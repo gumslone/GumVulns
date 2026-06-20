@@ -388,6 +388,17 @@ $ordered = Merger::orderForCpe([$hi, $lo]);
 eq($ordered[0]->cveId, 'CVE-LO', 'order: confirmed-vulnerable first');
 
 /* -------------------------------------------------------------------------- */
+section('CPE info (CIRCL meta)');
+
+$info = Renderer::cpeInfo(Cpe::parse('apache:log4j:2.14.1'),
+    resp(json_encode(['poi', 'log4j', 'tomcat'])), 'circl', null);
+ok(str_contains($info, 'log4j  (CIRCL)'), 'circl meta title from vendor catalog');
+ok(str_contains($info, 'In CIRCL DB:') && str_contains($info, 'yes'), 'circl meta marks product known');
+$info = Renderer::cpeInfo(Cpe::parse('apache:notathing:1.0'),
+    resp(json_encode(['poi', 'log4j'])), 'circl', null);
+ok(str_contains($info, 'In CIRCL DB:'), 'circl meta reports unknown product');
+
+/* -------------------------------------------------------------------------- */
 section('HTTP cache');
 
 // A fresh cache file is served without hitting the network.

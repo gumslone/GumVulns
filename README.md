@@ -300,8 +300,10 @@ export VULNCHECK_API_KEY=...
 ```
 
 Without `NVD_API_KEY`, NVD's API is rate-limited and often slow, so GumVulns
-gives NVD a longer per-request timeout and skips the secondary CPE-title lookup
-(which would otherwise compete with the main NVD search). It may still time out —
+gives NVD a longer per-request timeout and, for the CPE "Title"/known-platform
+info, uses **CIRCL's vendor catalog** (`/api/browse/<vendor>`) instead of a
+second, competing NVD CPE-dictionary call. (With a key set, the official NVD CPE
+title is used.) The main NVD search may still time out —
 the diagnostics footer will say so and point you to the free key. The general
 per-request network timeout is `--timeout=SECONDS` (default 30).
 

@@ -2060,11 +2060,19 @@ final class Aggregator
             }
         }
 
-        // The CPE-title lookup is a second NVD call; skip it without a key so it
-        // doesn't compete with the main NVD search (keyless NVD throttles hard).
+        // CPE info ("Title"/known): prefer NVD's CPE dictionary when a key is set;
+        // otherwise use CIRCL's vendor catalog so we don't make a second, slow,
+        // keyless NVD call that competes with the main NVD search.
         $hasNvdKey = ($k = getenv('NVD_API_KEY')) !== false && $k !== '';
-        if ($q->type === QueryType::Cpe && $q->cpe !== null && $hasNvdKey) {
-            $reqs['__cpe_meta'] = $this->cpeMetaRequest($q->cpe);
+        $metaKind  = null;
+        if ($q->type === QueryType::Cpe && $q->cpe !== null) {
+            if ($hasNvdKey) {
+                $reqs['__cpe_meta'] = $this->cpeMetaRequest($q->cpe);
+                $metaKind = 'nvd';
+            } elseif ($q->cpe->vendor !== '*') {
+                $reqs['__cpe_meta'] = $this->circlBrowseRequest($q->cpe->vendor);
+                $metaKind = 'circl';
+            }
         }
 
         $responses = Http::parallel($reqs, $this->timeout);
@@ -2091,11 +2099,24 @@ final class Aggregator
         }
 
         return [
-            'results'     => $results,
-            'diagnostics' => $diagnostics,
-            'cpe_meta'    => $responses['__cpe_meta'] ?? null,
-            'ran'         => array_keys($jobs),
+            'results'        => $results,
+            'diagnostics'    => $diagnostics,
+            'cpe_meta'       => $responses['__cpe_meta'] ?? null,
+            'cpe_meta_kind'  => $metaKind,
+            'ran'            => array_keys($jobs),
         ];
+    }
+
+    private function circlBrowseRequest(string $vendor): HttpRequest
+    {
+        $req = new HttpRequest(
+            'https://cve.circl.lu/api/browse/' . rawurlencode(strtolower($vendor)),
+            'GET',
+            ['Accept: application/json']
+        );
+        $req->timeout  = 20;
+        $req->cacheTtl = 21600; // 6h
+        return $req;
     }
 
     /**
@@ -2568,18 +2589,28 @@ final class Renderer
         return '? unknown — no comparable version range for this product';
     }
 
-    public static function cpeInfo(Cpe $cpe, ?HttpResponse $meta, ?array $eol = null): string
+    public static function cpeInfo(Cpe $cpe, ?HttpResponse $meta, ?string $metaKind = 'nvd', ?array $eol = null): string
     {
         $out = "\nParsed CPE\n" . self::RULE;
         foreach ($cpe->components() as $label => $value) {
             $out .= self::row($label, $value !== '' ? $value : '—');
         }
-        [$titles, $deprecated] = self::cpeMeta($meta);
-        if ($titles) {
-            $out .= self::row('Title', implode("\n               ", array_slice($titles, 0, 3)));
-        }
-        if ($deprecated !== null) {
-            $out .= self::row('Deprecated', $deprecated ? 'yes' : 'no');
+        if ($metaKind === 'circl') {
+            [$title, $known] = self::circlMeta($meta, $cpe->product);
+            if ($title !== '') {
+                $out .= self::row('Title', $title . '  (CIRCL)');
+            }
+            if ($known !== null) {
+                $out .= self::row('In CIRCL DB', $known ? 'yes' : 'no');
+            }
+        } else {
+            [$titles, $deprecated] = self::cpeMeta($meta);
+            if ($titles) {
+                $out .= self::row('Title', implode("\n               ", array_slice($titles, 0, 3)));
+            }
+            if ($deprecated !== null) {
+                $out .= self::row('Deprecated', $deprecated ? 'yes' : 'no');
+            }
         }
         if ($eol !== null) {
             $flag = $eol['status'] === 'END-OF-LIFE' ? '⚠ ' : '';
@@ -2616,6 +2647,36 @@ final class Renderer
             }
         }
         return [array_keys($titles), $deprecated];
+    }
+
+    /**
+     * Derive a CPE title from CIRCL's /api/browse/<vendor> product list.
+     * @return array{0:string,1:?bool} [title, product-known-in-CIRCL]
+     */
+    private static function circlMeta(?HttpResponse $meta, string $product): array
+    {
+        if ($meta === null || !$meta->ok()) {
+            return ['', null];
+        }
+        $products = json_decode($meta->body, true);
+        if (!is_array($products)) {
+            return ['', null];
+        }
+        $needle = strtolower($product);
+        $match  = '';
+        foreach ($products as $p) {
+            $name = strtolower((string) $p);
+            if ($name === $needle) {       // exact match wins
+                $match = (string) $p;
+                break;
+            }
+            if ($match === '' && $needle !== '' && str_contains($name, $needle)) {
+                $match = (string) $p;      // first fuzzy match, keep looking for exact
+            }
+        }
+        $known = $match !== '';
+        $title = $known ? $match : $product;
+        return [$title, $known];
     }
 
     private static function row(string $label, string $value): string
@@ -3114,7 +3175,7 @@ function gumvulns_main(array $argv): int
         if ($query->cpeResolved) {
             echo "  (CPE vendor/product resolved from purl via the NVD CPE dictionary)\n";
         }
-        echo Renderer::cpeInfo($query->cpe, $res['cpe_meta'], $eol);
+        echo Renderer::cpeInfo($query->cpe, $res['cpe_meta'], $res['cpe_meta_kind'] ?? null, $eol);
         echo "\nVulnerabilities (" . count($results) . " of {$total})\n";
     }
     echo Renderer::table($results);
