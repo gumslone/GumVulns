@@ -56,6 +56,7 @@ final class Query
     public ?GitHubRef $github;     // parsed GitHub download link, if any
     /** @var array{ecosystem:?string,name:?string,purl:?string,version:?string}|null */
     public ?array $osv = null;     // explicit OSV package query (--osv-package)
+    public bool $cpeResolved = false; // CPE vendor/product resolved from a purl
 
     public function __construct(
         QueryType $type,
@@ -2507,7 +2508,82 @@ function gumvulns_parse_purl(string $purl): ?array
     return ['type' => $type, 'namespace' => $namespace, 'name' => $name, 'version' => $version];
 }
 
-function gumvulns_parse_query(string $raw, bool $forceCpe): Query
+/** Fetch NVD CPE-dictionary entries for a keyword (cached 24h). */
+function gumvulns_nvd_cpe_dict(string $keyword): array
+{
+    $file = gumvulns_cache_dir() . '/cpedict_' . sha1(strtolower($keyword)) . '.json';
+    if (!gumvulns_cache_fresh($file, 86400)) {
+        $headers = ['Accept: application/json'];
+        $key = getenv('NVD_API_KEY');
+        if ($key !== false && $key !== '') {
+            $headers[] = 'apiKey: ' . $key;
+        }
+        $url  = 'https://services.nvd.nist.gov/rest/json/cpes/2.0?keywordSearch='
+            . rawurlencode($keyword) . '&resultsPerPage=50';
+        $resp = Http::parallel(['c' => new HttpRequest($url, 'GET', $headers)], 30)['c'];
+        if ($resp->ok() && $resp->body !== '') {
+            @file_put_contents($file, $resp->body);
+        }
+    }
+    if (!is_file($file)) {
+        return [];
+    }
+    $d = json_decode((string) file_get_contents($file), true);
+    return is_array($d) ? ($d['products'] ?? []) : [];
+}
+
+/**
+ * Resolve a purl package name to a real NVD vendor:product via the CPE
+ * dictionary. Tries the name, its base (before -/.), de-suffixed variants and
+ * the namespace's last token; picks the most common application CPE whose
+ * product relates to the candidate.
+ *
+ * @return array{vendor:string,product:string}|null
+ */
+function gumvulns_resolve_cpe_from_name(string $name, ?string $namespace): ?array
+{
+    $name  = strtolower($name);
+    $cands = [$name];
+    if (preg_match('/^([a-z0-9]+)[._-]/', $name, $m)) {
+        $cands[] = $m[1];
+    }
+    foreach (['-core', '-api', '-server', '-client', '.js', '-js'] as $suf) {
+        if (str_ends_with($name, $suf)) {
+            $cands[] = substr($name, 0, -strlen($suf));
+        }
+    }
+    if ($namespace !== null && $namespace !== '') {
+        $segs = preg_split('#[/.]#', strtolower($namespace)) ?: [];
+        $last = (string) end($segs);
+        if ($last !== '') {
+            $cands[] = $last;
+        }
+    }
+    foreach (array_values(array_unique(array_filter($cands))) as $kw) {
+        $tally = [];
+        foreach (gumvulns_nvd_cpe_dict($kw) as $p) {
+            if (!empty($p['cpe']['deprecated'])) {
+                continue;
+            }
+            $parts = explode(':', (string) ($p['cpe']['cpeName'] ?? ''));
+            if (count($parts) < 6 || $parts[2] !== 'a') {
+                continue;
+            }
+            [$vendor, $product] = [$parts[3], $parts[4]];
+            if ($product === $kw || str_contains($product, $kw) || str_contains($kw, $product)) {
+                $tally[$vendor . ':' . $product] = ($tally[$vendor . ':' . $product] ?? 0) + 1;
+            }
+        }
+        if ($tally) {
+            arsort($tally);
+            [$v, $pr] = explode(':', (string) array_key_first($tally), 2);
+            return ['vendor' => $v, 'product' => $pr];
+        }
+    }
+    return null;
+}
+
+function gumvulns_parse_query(string $raw, bool $forceCpe, bool $resolveCpe = true): Query
 {
     // Package URL (purl): OSV queries it natively; derive product/version so the
     // CPE-capable sources, version flag and enrichment apply too.
@@ -2517,9 +2593,13 @@ function gumvulns_parse_query(string $raw, bool $forceCpe): Query
             fwrite(STDERR, "Could not parse purl (expected pkg:type/namespace/name@version).\n");
             exit(1);
         }
-        $cpe = Cpe::fromParts('', $p['name'], $p['version'] ?? '*');
-        $q   = new Query(QueryType::Cpe, $raw, $cpe);
+        $resolved = $resolveCpe ? gumvulns_resolve_cpe_from_name($p['name'], $p['namespace']) : null;
+        $cpe = $resolved !== null
+            ? Cpe::fromParts($resolved['vendor'], $resolved['product'], $p['version'] ?? '*')
+            : Cpe::fromParts('', $p['name'], $p['version'] ?? '*');
+        $q = new Query(QueryType::Cpe, $raw, $cpe);
         $q->osv = ['ecosystem' => null, 'name' => null, 'purl' => $raw, 'version' => null];
+        $q->cpeResolved = $resolved !== null;
         return $q;
     }
 
@@ -2559,6 +2639,7 @@ function gumvulns_main(array $argv): int
     $only      = null;
     $limit     = null;
     $osvSpec   = null;
+    $noCpeResolve = false;
     $queryBits = [];
 
     foreach ($args as $arg) {
@@ -2570,6 +2651,8 @@ function gumvulns_main(array $argv): int
             $noPoc = true;
         } elseif (str_starts_with($arg, '--osv-package=')) {
             $osvSpec = substr($arg, 14);
+        } elseif ($arg === '--no-cpe-resolve') {
+            $noCpeResolve = true;
         } elseif ($arg === '--list-sources') {
             foreach (gumvulns_sources() as $s) {
                 printf("  %-12s %-22s (%s)\n", $s->id(), $s->name(), $s->isEnabled() ? 'enabled' : 'needs API key');
@@ -2593,7 +2676,7 @@ function gumvulns_main(array $argv): int
         return 1;
     }
 
-    $query = gumvulns_parse_query($raw, $forceCpe);
+    $query = gumvulns_parse_query($raw, $forceCpe, !$noCpeResolve);
 
     // Explicit OSV package query, merged in alongside the main query's results.
     if ($osvSpec !== null) {
@@ -2693,6 +2776,7 @@ function gumvulns_main(array $argv): int
         ];
         if ($query->cpe) {
             $payload['cpe'] = $query->cpe->components();
+            $payload['cpe_resolved_from_purl'] = $query->cpeResolved;
         }
         if ($query->github) {
             $payload['github'] = $query->github->describe();
@@ -2715,6 +2799,9 @@ function gumvulns_main(array $argv): int
         echo Renderer::osvInfo($query->osv);
     }
     if ($query->cpe) {
+        if ($query->cpeResolved) {
+            echo "  (CPE vendor/product resolved from purl via the NVD CPE dictionary)\n";
+        }
         echo Renderer::cpeInfo($query->cpe, $res['cpe_meta'], $eol);
         echo "\nVulnerabilities (" . count($results) . " of {$total})\n";
     }
@@ -2742,6 +2829,8 @@ Options:
   --osv-package=SPEC  Add an OSV package query, merged into the results.
                       SPEC = ecosystem:name[@version] or a purl. Version
                       defaults to the CPE version when one is given.
+  --no-cpe-resolve    For purl queries, don't resolve the package name to a
+                      vendor:product via the NVD CPE dictionary.
   --list-sources      List sources and whether they are enabled.
   -h, --help          Show this help.
 

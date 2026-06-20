@@ -93,10 +93,18 @@ php gumvulns.php "pkg:npm/lodash@4.17.20"
 php gumvulns.php "pkg:pypi/django@3.2"
 ```
 
-The purl's `name` and `version` are also used to query the CPE-capable sources
-(NVD, Shodan, EUVD, Vulners) and to drive the exploit/PoC and EOL enrichment, all
-merged by CVE id. OSV is the authoritative matcher here; the CPE sources are
-best-effort (the purl name may not equal a vendor's CPE product string).
+To also drive the **CPE-capable sources** (NVD, Shodan, EUVD, Vulners), the purl
+name is resolved to a real `vendor:product` via **NVD's CPE dictionary** — e.g.
+`pkg:maven/org.apache.logging.log4j/log4j-core` resolves to `apache:log4j`, so
+those sources match and merge in by CVE id (with the version flag, exploit/PoC
+and EOL enrichment). The resolver tries the name, its base (before `-`/`.`),
+de-suffixed variants (`-core`, `.js`, …) and the namespace's last token; results
+are cached for 24h. If nothing resolves it falls back to using the purl name as
+the product.
+
+> Resolution queries NVD, which is heavily throttled without an `NVD_API_KEY` —
+> set the key for reliable, fast resolution. Disable it with `--no-cpe-resolve`
+> (OSV still answers the purl natively).
 
 ### GitHub link mode
 
