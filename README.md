@@ -56,6 +56,25 @@ exploit** (see below) ranks above an unexploited one.
 > NVD and Shodan reject a wildcard part. Pass `o:` or `h:` for OS/hardware.
 > Results are capped at 50 by default in CPE mode — raise it with `--limit`.
 
+### Adding OSV in CPE mode (`--osv-package`)
+
+OSV.dev has no CPE search — its query API is keyed on a package coordinate, not a
+CPE. To pull OSV results into a CPE search, supply the package explicitly:
+
+```bash
+php gumvulns.php --cpe apache:log4j:2.14.1 \
+    --osv-package=Maven:org.apache.logging.log4j:log4j-core
+# or a Package URL:
+php gumvulns.php --cpe apache:log4j:2.14.1 \
+    --osv-package="pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1"
+```
+
+`SPEC` is `ecosystem:name[@version]` (the name may itself contain `:`, e.g. Maven
+coordinates) or a purl. The version defaults to the CPE version when one is
+given, so OSV returns exactly the advisories affecting that version — these merge
+into the CPE results by CVE id and are flagged **VULNERABLE** via OSV's version
+ranges.
+
 ### GitHub link mode
 
 Paste a GitHub download or source URL and GumVulns extracts the relevant pieces:

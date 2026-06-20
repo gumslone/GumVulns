@@ -54,6 +54,8 @@ final class Query
     public ?Cpe $cpe;
     public ?string $commit;        // git commit SHA to query (OSV)
     public ?GitHubRef $github;     // parsed GitHub download link, if any
+    /** @var array{ecosystem:?string,name:?string,purl:?string,version:?string}|null */
+    public ?array $osv = null;     // explicit OSV package query (--osv-package)
 
     public function __construct(
         QueryType $type,
@@ -1255,11 +1257,23 @@ final class OsvSource extends VulnSource
 
     public function buildRequest(Query $q): ?HttpRequest
     {
+        $h = ['Content-Type: application/json', 'Accept: application/json'];
+
         // Commit-based query (e.g. from a GitHub download link) takes priority.
         if ($q->commit !== null && $q->commit !== '') {
             $body = json_encode(['commit' => $q->commit]);
-            return new HttpRequest('https://api.osv.dev/v1/query', 'POST',
-                ['Content-Type: application/json', 'Accept: application/json'], $body ?: null);
+            return new HttpRequest('https://api.osv.dev/v1/query', 'POST', $h, $body ?: null);
+        }
+        // Explicit package query (--osv-package): name+ecosystem or purl, +version.
+        if ($q->osv !== null) {
+            $pkg = $q->osv['purl'] !== null
+                ? ['purl' => $q->osv['purl']]
+                : ['name' => $q->osv['name'], 'ecosystem' => $q->osv['ecosystem']];
+            $payload = ['package' => $pkg];
+            if (!empty($q->osv['version'])) {
+                $payload['version'] = $q->osv['version'];
+            }
+            return new HttpRequest('https://api.osv.dev/v1/query', 'POST', $h, json_encode($payload) ?: null);
         }
         if ($q->type === QueryType::CveId) {
             return new HttpRequest(
@@ -2406,6 +2420,45 @@ function gumvulns_resolve_commit(string $owner, string $repo, string $sha): stri
 }
 
 /** Decide the query type from the raw input and flags. */
+/**
+ * Parse an --osv-package spec into an OSV query descriptor.
+ * Accepts "ecosystem:name[@version]" (name may contain ':', e.g. Maven coords)
+ * or a Package URL "pkg:type/ns/name[@version]".
+ *
+ * @return array{ecosystem:?string,name:?string,purl:?string,version:?string}|null
+ */
+function gumvulns_parse_osv_spec(string $spec, ?string $fallbackVersion): ?array
+{
+    $spec = trim($spec);
+    if ($spec === '') {
+        return null;
+    }
+    if (str_starts_with($spec, 'pkg:')) {
+        // A purl can embed its own @version; if so don't also pass version.
+        return [
+            'ecosystem' => null,
+            'name'      => null,
+            'purl'      => $spec,
+            'version'   => str_contains($spec, '@') ? null : $fallbackVersion,
+        ];
+    }
+    $version = $fallbackVersion;
+    if (preg_match('/^(.*)@([^@]+)$/', $spec, $m)) {
+        $spec    = $m[1];
+        $version = $m[2];
+    }
+    $pos = strpos($spec, ':');
+    if ($pos === false || $pos === 0 || $pos === strlen($spec) - 1) {
+        return null; // need both ecosystem and name
+    }
+    return [
+        'ecosystem' => substr($spec, 0, $pos),
+        'name'      => substr($spec, $pos + 1),
+        'purl'      => null,
+        'version'   => $version,
+    ];
+}
+
 function gumvulns_parse_query(string $raw, bool $forceCpe): Query
 {
     // GitHub download/source link: extract commit (for OSV) and owner/repo/version (for CPE sources).
@@ -2443,6 +2496,7 @@ function gumvulns_main(array $argv): int
     $noPoc     = false;
     $only      = null;
     $limit     = null;
+    $osvSpec   = null;
     $queryBits = [];
 
     foreach ($args as $arg) {
@@ -2452,6 +2506,8 @@ function gumvulns_main(array $argv): int
             $forceCpe = true;
         } elseif ($arg === '--no-poc') {
             $noPoc = true;
+        } elseif (str_starts_with($arg, '--osv-package=')) {
+            $osvSpec = substr($arg, 14);
         } elseif ($arg === '--list-sources') {
             foreach (gumvulns_sources() as $s) {
                 printf("  %-12s %-22s (%s)\n", $s->id(), $s->name(), $s->isEnabled() ? 'enabled' : 'needs API key');
@@ -2476,6 +2532,17 @@ function gumvulns_main(array $argv): int
     }
 
     $query = gumvulns_parse_query($raw, $forceCpe);
+
+    // Explicit OSV package query, merged in alongside the main query's results.
+    if ($osvSpec !== null) {
+        $fallbackVersion = ($query->cpe && $query->cpe->hasVersion()) ? $query->cpe->version : null;
+        $osv = gumvulns_parse_osv_spec($osvSpec, $fallbackVersion);
+        if ($osv === null) {
+            fwrite(STDERR, "Invalid --osv-package (use ecosystem:name[@version] or a purl, e.g. Maven:org.apache.logging.log4j:log4j-core).\n");
+            return 1;
+        }
+        $query->osv = $osv;
+    }
 
     $sources = gumvulns_sources();
     if ($only !== null) {
@@ -2604,6 +2671,9 @@ Options:
   --limit=N           Cap results (default 50 in CPE mode).
   --no-poc            Skip exploit/PoC enrichment (Nuclei, Exploit-DB,
                       Metasploit, PoC-in-GitHub).
+  --osv-package=SPEC  Add an OSV package query, merged into the results.
+                      SPEC = ecosystem:name[@version] or a purl. Version
+                      defaults to the CPE version when one is given.
   --list-sources      List sources and whether they are enabled.
   -h, --help          Show this help.
 
@@ -2616,6 +2686,8 @@ Examples:
   php gumvulns.php "cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*"
   php gumvulns.php --cpe apache:log4j
   php gumvulns.php --cpe a:openbsd:openssh:9.1 --limit=20
+  php gumvulns.php --cpe apache:log4j:2.14.1 \
+      --osv-package=Maven:org.apache.logging.log4j:log4j-core
 
 GitHub links (commit -> OSV.dev; owner/repo/tag -> CPE sources):
   php gumvulns.php https://github.com/jquery/jquery/archive/refs/tags/3.3.1.zip
