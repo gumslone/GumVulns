@@ -418,6 +418,36 @@ Http::$cacheEnabled = true;
 @unlink(Http::cachePath($creq2));
 
 /* -------------------------------------------------------------------------- */
+section('Library API (gumvulns_search / gumvulns_payload)');
+
+// Validation happens before any network call, so these are offline-safe.
+$threw = false;
+try { gumvulns_search(''); } catch (InvalidArgumentException $e) { $threw = true; }
+ok($threw, 'gumvulns_search throws on empty input');
+
+$threw = false;
+try { gumvulns_search('CVE-2021-44228', ['sources' => ['nope']]); }
+catch (InvalidArgumentException $e) { $threw = true; }
+ok($threw, 'gumvulns_search throws on unknown source filter');
+
+$threw = false;
+try { gumvulns_search('CVE-2021-44228', ['osv_package' => 'not-valid']); }
+catch (InvalidArgumentException $e) { $threw = true; }
+ok($threw, 'gumvulns_search throws on bad osv_package');
+
+// gumvulns_payload shapes a search result into a JSON-ready array.
+$fakeQuery = new Query(QueryType::Cpe, 'apache:log4j:2.14.1', Cpe::parse('apache:log4j:2.14.1'));
+$fakeVuln  = new Vulnerability('CVE-2021-44228', 'd', 10.0, 'CRITICAL', '', 'NVD (NIST)');
+$payload = gumvulns_payload([
+    'query' => $fakeQuery, 'results' => [$fakeVuln], 'total' => 1,
+    'diagnostics' => [], 'cpe_meta' => null, 'cpe_meta_kind' => null, 'eol' => null,
+]);
+eq($payload['type'], 'cpe', 'payload type');
+eq($payload['total'], 1, 'payload total');
+eq($payload['results'][0]['cve_id'], 'CVE-2021-44228', 'payload result cve');
+ok(isset($payload['cpe']), 'payload includes cpe components');
+
+/* -------------------------------------------------------------------------- */
 section('Vulnerability helpers');
 
 eq(Vulnerability::severityFromScore(10.0), 'CRITICAL', 'severity 10 -> critical');

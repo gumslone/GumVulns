@@ -2938,8 +2938,7 @@ function gumvulns_parse_query(string $raw, bool $forceCpe, bool $resolveCpe = tr
     if (stripos($raw, 'pkg:') === 0) {
         $p = gumvulns_parse_purl($raw);
         if ($p === null) {
-            fwrite(STDERR, "Could not parse purl (expected pkg:type/namespace/name@version).\n");
-            exit(1);
+            throw new InvalidArgumentException('Could not parse purl (expected pkg:type/namespace/name@version).');
         }
         $resolved = $resolveCpe ? gumvulns_resolve_cpe_from_name($p['name'], $p['namespace']) : null;
         $cpe = $resolved !== null
@@ -2961,15 +2960,13 @@ function gumvulns_parse_query(string $raw, bool $forceCpe, bool $resolveCpe = tr
             }
             return new Query(QueryType::Cpe, $raw, $gh->toCpe(), $gh->commit, $gh);
         }
-        fwrite(STDERR, "Unrecognized URL (only GitHub links are supported).\n");
-        exit(1);
+        throw new InvalidArgumentException('Unrecognized URL (only GitHub links are supported).');
     }
 
     if ($forceCpe || stripos($raw, 'cpe:') === 0) {
         $cpe = Cpe::parse($raw);
         if ($cpe === null) {
-            fwrite(STDERR, "Could not parse a vendor/product from the CPE input.\n");
-            exit(1);
+            throw new InvalidArgumentException('Could not parse a vendor/product from the CPE input.');
         }
         return new Query(QueryType::Cpe, $raw, $cpe);
     }
@@ -2977,6 +2974,184 @@ function gumvulns_parse_query(string $raw, bool $forceCpe, bool $resolveCpe = tr
         return new Query(QueryType::CveId, $raw);
     }
     return new Query(QueryType::Keyword, $raw);
+}
+
+/**
+ * Library entry point — run a full search and return structured results.
+ *
+ * @param string $input CVE id, keywords, CPE / CPE-stub, purl, or GitHub URL.
+ * @param array{
+ *   cpe?:bool, resolve_cpe?:bool, sources?:string[]|null, limit?:?int,
+ *   timeout?:int, no_poc?:bool, no_enrich?:bool, no_cache?:bool, osv_package?:?string
+ * } $options
+ * @return array{
+ *   query: Query, results: Vulnerability[], total: int,
+ *   diagnostics: array<int,array<string,mixed>>, cpe_meta: ?HttpResponse,
+ *   cpe_meta_kind: ?string, eol: ?array
+ * }
+ * @throws InvalidArgumentException on invalid input or options.
+ */
+function gumvulns_search(string $input, array $options = []): array
+{
+    $input = trim($input);
+    if ($input === '') {
+        throw new InvalidArgumentException('Empty query.');
+    }
+    $opt = $options + [
+        'cpe' => false, 'resolve_cpe' => true, 'sources' => null, 'limit' => null,
+        'timeout' => 30, 'no_poc' => false, 'no_enrich' => false, 'no_cache' => false,
+        'osv_package' => null,
+    ];
+
+    $prevCache = Http::$cacheEnabled;
+    if ($opt['no_cache']) {
+        Http::$cacheEnabled = false;
+    }
+    try {
+        $query = gumvulns_parse_query($input, (bool) $opt['cpe'], (bool) $opt['resolve_cpe']);
+
+        if ($opt['osv_package'] !== null && $opt['osv_package'] !== '') {
+            $fallbackVersion = ($query->cpe && $query->cpe->hasVersion()) ? $query->cpe->version : null;
+            $osv = gumvulns_parse_osv_spec((string) $opt['osv_package'], $fallbackVersion);
+            if ($osv === null) {
+                throw new InvalidArgumentException('Invalid osv_package (use ecosystem:name[@version] or a purl).');
+            }
+            $query->osv = $osv;
+        }
+
+        $sources = gumvulns_sources();
+        if ($opt['sources'] !== null) {
+            $only = (array) $opt['sources'];
+            $sources = array_values(array_filter($sources, static fn (VulnSource $s) => in_array($s->id(), $only, true)));
+            if (!$sources) {
+                throw new InvalidArgumentException('No matching sources for the given filter.');
+            }
+        }
+
+        $limit = $opt['limit'] !== null ? max(1, (int) $opt['limit']) : null;
+        $agg   = new Aggregator($sources, max(5, (int) $opt['timeout']));
+        $res   = $agg->search($query);
+        $results = $res['results'];
+
+        // CPE mode: collapse to one row per CVE and apply a sane default cap.
+        if ($query->type === QueryType::Cpe) {
+            $results = Merger::mergeByCve($results);
+            $limit   = $limit ?? 50;
+
+            // Phase 2: cross-reference discovered CVEs against remaining CVE-keyed sources.
+            if (!$opt['no_enrich'] && $results) {
+                $top    = array_slice(Merger::orderForCpe($results), 0, $limit);
+                $cveIds = array_map(static fn (Vulnerability $v) => $v->cveId, $top);
+                $enr    = $agg->enrich($cveIds, $res['ran']);
+                if ($enr['results']) {
+                    $results = Merger::mergeByCve(array_merge($results, $enr['results']));
+                }
+                $res['diagnostics'] = array_merge($res['diagnostics'], $enr['diagnostics']);
+            }
+        }
+
+        // Flag whether the queried version is inside any affected range.
+        $targetVersion = ($query->cpe && $query->cpe->hasVersion()) ? $query->cpe->version : null;
+        if ($targetVersion !== null) {
+            foreach ($results as $v) {
+                [$verdict, $matched] = VersionFlag::evaluate($v, $targetVersion, $query->cpe->product);
+                $v->versionChecked   = true;
+                $v->vulnerable       = $verdict;
+                $v->matchedRange     = $matched;
+            }
+        }
+
+        // Exploit/PoC enrichment from the bulk indexes (cached) + per-CVE PoC-in-GitHub.
+        if (!$opt['no_poc']) {
+            $indexes  = gumvulns_exploit_indexes();
+            $expCount = 0;
+            foreach ($results as $v) {
+                $cve = strtoupper($v->cveId);
+                $ex  = [];
+                foreach ($indexes as $srcName => $map) {
+                    foreach (array_unique($map[$cve] ?? []) as $url) {
+                        $ex[] = ['source' => $srcName, 'url' => $url];
+                    }
+                }
+                if ($query->type === QueryType::CveId) {
+                    foreach (gumvulns_poc_in_github($cve) as $url) {
+                        $ex[] = ['source' => 'PoC-in-GitHub', 'url' => $url];
+                    }
+                }
+                if ($ex) {
+                    $v->exploits = $ex;
+                    $expCount++;
+                }
+            }
+            $res['diagnostics'][] = ['source' => 'Exploit indexes', 'status' => 200, 'count' => $expCount, 'error' => ''];
+        }
+
+        // Lifecycle (EOL) status for the queried product/version.
+        $eol = null;
+        if ($query->cpe && $query->cpe->hasVersion()) {
+            $eol = gumvulns_eol($query->cpe->product, $query->cpe->version);
+        }
+
+        if ($query->type === QueryType::Cpe) {
+            $results = Merger::orderForCpe($results);
+        }
+
+        $total = count($results);
+        if ($limit !== null && $total > $limit) {
+            $results = array_slice($results, 0, $limit);
+        }
+
+        return [
+            'query'         => $query,
+            'results'       => $results,
+            'total'         => $total,
+            'diagnostics'   => $res['diagnostics'],
+            'cpe_meta'      => $res['cpe_meta'] ?? null,
+            'cpe_meta_kind' => $res['cpe_meta_kind'] ?? null,
+            'eol'           => $eol,
+        ];
+    } finally {
+        Http::$cacheEnabled = $prevCache;
+    }
+}
+
+/**
+ * Convert a gumvulns_search() result into a plain, JSON-ready array.
+ *
+ * @param array $res result from gumvulns_search()
+ * @return array<string,mixed>
+ */
+function gumvulns_payload(array $res): array
+{
+    /** @var Query $query */
+    $query   = $res['query'];
+    $results = $res['results'];
+
+    $payload = [
+        'query'       => $query->raw,
+        'type'        => $query->type->value,
+        'total'       => $res['total'],
+        'shown'       => count($results),
+        'results'     => array_map(static fn (Vulnerability $v) => $v->toArray(), $results),
+        'diagnostics' => $res['diagnostics'],
+    ];
+    if ($query->cpe) {
+        $payload['cpe'] = $query->cpe->components();
+        $payload['cpe_resolved_from_purl'] = $query->cpeResolved;
+    }
+    if ($query->github) {
+        $payload['github'] = $query->github->describe();
+    }
+    if ($query->purl) {
+        $payload['purl'] = $query->purl;
+    }
+    if ($query->osv) {
+        $payload['osv'] = $query->osv;
+    }
+    if ($res['eol'] !== null) {
+        $payload['eol'] = $res['eol'];
+    }
+    return $payload;
 }
 
 function gumvulns_main(array $argv): int
@@ -2990,6 +3165,7 @@ function gumvulns_main(array $argv): int
     $limit     = null;
     $osvSpec   = null;
     $noCpeResolve = false;
+    $noCache   = false;
     $timeout   = 30;
     $queryBits = [];
 
@@ -3007,7 +3183,7 @@ function gumvulns_main(array $argv): int
         } elseif ($arg === '--no-cpe-resolve') {
             $noCpeResolve = true;
         } elseif ($arg === '--no-cache') {
-            Http::$cacheEnabled = false;
+            $noCache = true;
         } elseif (str_starts_with($arg, '--timeout=')) {
             $timeout = max(5, (int) substr($arg, 10));
         } elseif ($arg === '--list-sources') {
@@ -3033,134 +3209,29 @@ function gumvulns_main(array $argv): int
         return 1;
     }
 
-    $query = gumvulns_parse_query($raw, $forceCpe, !$noCpeResolve);
-
-    // Explicit OSV package query, merged in alongside the main query's results.
-    if ($osvSpec !== null) {
-        $fallbackVersion = ($query->cpe && $query->cpe->hasVersion()) ? $query->cpe->version : null;
-        $osv = gumvulns_parse_osv_spec($osvSpec, $fallbackVersion);
-        if ($osv === null) {
-            fwrite(STDERR, "Invalid --osv-package (use ecosystem:name[@version] or a purl, e.g. Maven:org.apache.logging.log4j:log4j-core).\n");
-            return 1;
-        }
-        $query->osv = $osv;
+    try {
+        $res = gumvulns_search($raw, [
+            'cpe'         => $forceCpe,
+            'resolve_cpe' => !$noCpeResolve,
+            'sources'     => $only,
+            'limit'       => $limit,
+            'timeout'     => $timeout,
+            'no_poc'      => $noPoc,
+            'no_enrich'   => $noEnrich,
+            'no_cache'    => $noCache,
+            'osv_package' => $osvSpec,
+        ]);
+    } catch (InvalidArgumentException $e) {
+        fwrite(STDERR, $e->getMessage() . "\n");
+        return 1;
     }
 
-    $sources = gumvulns_sources();
-    if ($only !== null) {
-        $sources = array_values(array_filter($sources, static fn (VulnSource $s) => in_array($s->id(), $only, true)));
-        if (!$sources) {
-            fwrite(STDERR, "No matching sources for --source filter.\n");
-            return 1;
-        }
-    }
-
-    $agg     = new Aggregator($sources, $timeout);
-    $res     = $agg->search($query);
+    /** @var Query $query */
+    $query   = $res['query'];
     $results = $res['results'];
 
-    // CPE mode: collapse to one row per CVE and apply a sane default cap.
-    if ($query->type === QueryType::Cpe) {
-        $results = Merger::mergeByCve($results);
-        $limit   = $limit ?? 50;
-
-        // Phase 2: cross-reference the discovered CVEs against the remaining
-        // CVE-keyed sources (CISA KEV, EPSS, CIRCL, OSV, VulnCheck, CVE Details).
-        if (!$noEnrich && $results) {
-            $top     = array_slice(Merger::orderForCpe($results), 0, $limit);
-            $cveIds  = array_map(static fn (Vulnerability $v) => $v->cveId, $top);
-            $enr     = $agg->enrich($cveIds, $res['ran']);
-            if ($enr['results']) {
-                $results = Merger::mergeByCve(array_merge($results, $enr['results']));
-            }
-            $res['diagnostics'] = array_merge($res['diagnostics'], $enr['diagnostics']);
-        }
-    }
-    // Flag whether the queried version is inside any affected range.
-    $targetVersion = ($query->cpe && $query->cpe->hasVersion()) ? $query->cpe->version : null;
-    if ($targetVersion !== null) {
-        foreach ($results as $v) {
-            [$verdict, $matched]  = VersionFlag::evaluate($v, $targetVersion, $query->cpe->product);
-            $v->versionChecked    = true;
-            $v->vulnerable        = $verdict;
-            $v->matchedRange      = $matched;
-        }
-    }
-
-    // Exploit/PoC enrichment from the bulk indexes (cached) + per-CVE PoC-in-GitHub.
-    if (!$noPoc) {
-        $indexes  = gumvulns_exploit_indexes();
-        $expCount = 0;
-        foreach ($results as $v) {
-            $cve = strtoupper($v->cveId);
-            $ex  = [];
-            foreach ($indexes as $src => $map) {
-                foreach (array_unique($map[$cve] ?? []) as $url) {
-                    $ex[] = ['source' => $src, 'url' => $url];
-                }
-            }
-            // PoC-in-GitHub is per-CVE, so only fetch it in single-CVE lookups.
-            if ($query->type === QueryType::CveId) {
-                foreach (gumvulns_poc_in_github($cve) as $url) {
-                    $ex[] = ['source' => 'PoC-in-GitHub', 'url' => $url];
-                }
-            }
-            if ($ex) {
-                $v->exploits = $ex;
-                $expCount++;
-            }
-        }
-        $res['diagnostics'][] = [
-            'source' => 'Exploit indexes',
-            'status' => 200,
-            'count'  => $expCount,
-            'error'  => '',
-        ];
-    }
-
-    // Lifecycle (EOL) status for the queried product/version.
-    $eol = null;
-    if ($query->cpe && $query->cpe->hasVersion()) {
-        $eol = gumvulns_eol($query->cpe->product, $query->cpe->version);
-    }
-
-    // CPE-mode ordering: confirmed-vulnerable first (when a version was checked),
-    // then by score, then a public exploit breaks ties above unexploited CVEs.
-    if ($query->type === QueryType::Cpe) {
-        $results = Merger::orderForCpe($results);
-    }
-
-    $total = count($results);
-    if ($limit !== null && $total > $limit) {
-        $results = array_slice($results, 0, $limit);
-    }
-
     if ($asJson) {
-        $payload = [
-            'query'   => $query->raw,
-            'type'    => $query->type->value,
-            'total'   => $total,
-            'shown'   => count($results),
-            'results' => array_map(static fn (Vulnerability $v) => $v->toArray(), $results),
-            'diagnostics' => $res['diagnostics'],
-        ];
-        if ($query->cpe) {
-            $payload['cpe'] = $query->cpe->components();
-            $payload['cpe_resolved_from_purl'] = $query->cpeResolved;
-        }
-        if ($query->github) {
-            $payload['github'] = $query->github->describe();
-        }
-        if ($query->purl) {
-            $payload['purl'] = $query->purl;
-        }
-        if ($query->osv) {
-            $payload['osv'] = $query->osv;
-        }
-        if ($eol !== null) {
-            $payload['eol'] = $eol;
-        }
-        echo json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+        echo json_encode(gumvulns_payload($res), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
         return 0;
     }
 
@@ -3175,8 +3246,8 @@ function gumvulns_main(array $argv): int
         if ($query->cpeResolved) {
             echo "  (CPE vendor/product resolved from purl via the NVD CPE dictionary)\n";
         }
-        echo Renderer::cpeInfo($query->cpe, $res['cpe_meta'], $res['cpe_meta_kind'] ?? null, $eol);
-        echo "\nVulnerabilities (" . count($results) . " of {$total})\n";
+        echo Renderer::cpeInfo($query->cpe, $res['cpe_meta'], $res['cpe_meta_kind'] ?? null, $res['eol']);
+        echo "\nVulnerabilities (" . count($results) . " of {$res['total']})\n";
     }
     echo Renderer::table($results);
     echo Renderer::diagnostics($res['diagnostics']);

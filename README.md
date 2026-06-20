@@ -10,6 +10,37 @@ vector, source**.
 
 PHP 8.1+ with `curl`, `json`, and `mbstring` extensions.
 
+## Use as a library
+
+`require` the script and call `gumvulns_search()` — the same pipeline the CLI
+uses. It returns `Vulnerability` objects (and metadata); `gumvulns_payload()`
+turns the result into the JSON-ready array. Invalid input throws
+`InvalidArgumentException` (nothing is printed and the process never exits).
+
+```php
+require __DIR__ . '/gumvulns.php';
+
+$res = gumvulns_search('pkg:npm/lodash@4.17.20', [
+    'limit'     => 20,     // cap results (default 50 in CPE/purl/GitHub mode)
+    'no_poc'    => false,  // exploit/PoC enrichment
+    'no_enrich' => false,  // phase-2 CVE cross-referencing
+    'no_cache'  => false,  // on-disk response cache
+    'sources'   => null,   // e.g. ['nvd','osv','circl']; null = all
+    'timeout'   => 30,
+]);
+
+foreach ($res['results'] as $v) {            // Vulnerability[]
+    printf("%s  %s  %s  vuln=%s\n",
+        $v->cveId, $v->score ?? '-', $v->severity,
+        var_export($v->vulnerable, true));   // true/false/null when a version is given
+}
+
+$json = json_encode(gumvulns_payload($res)); // same shape as CLI --json
+```
+
+Options mirror the CLI flags (`cpe`, `resolve_cpe`, `sources`, `limit`,
+`timeout`, `no_poc`, `no_enrich`, `no_cache`, `osv_package`).
+
 ## Usage
 
 Three query modes, auto-detected from the input:
