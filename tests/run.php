@@ -142,7 +142,7 @@ eq(GitHubRef::parse('https://example.com/foo/bar'), null, 'non-github url -> nul
 section('purl parsing');
 
 $p = gumvulns_parse_purl('pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1');
-eq($p['purl'], 'pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1', 'purl full unparsed string');
+eq($p['raw'], 'pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1', 'purl raw unparsed string');
 eq($p['type'], 'maven', 'purl type');
 eq($p['namespace'], 'org.apache.logging.log4j', 'purl namespace');
 eq($p['name'], 'log4j-core', 'purl name');
