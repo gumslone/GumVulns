@@ -285,6 +285,16 @@ $out = $epss->parse(resp(json_encode(['data' => [
 eq(count($out), 2, 'epss parses multiple rows');
 eq($out[1]->cveId, 'CVE-2', 'epss row cve id');
 
+// CIRCL base URL is configurable (self-hosted vulnerability-lookup)
+eq(Config::circlBase(), 'https://cve.circl.lu/api', 'circl base default');
+Config::$circlBase = 'http://localhost:8000/api/';
+eq(Config::circlBase(), 'http://localhost:8000/api', 'circl base override (trailing slash trimmed)');
+$lreq = (new CirclSource())->buildRequest(new Query(QueryType::CveId, 'CVE-2021-44228'));
+ok(str_starts_with($lreq->url, 'http://localhost:8000/api/cve/'), 'circl uses overridden base for CVE');
+$lreq = (new CirclSource())->buildRequest(new Query(QueryType::Cpe, 'x', Cpe::parse('apache:log4j:2.14.1')));
+ok(str_starts_with($lreq->url, 'http://localhost:8000/api/vulnerability/cpesearch/'), 'circl uses overridden base for cpesearch');
+Config::$circlBase = null; // restore default for the rest of the suite
+
 // CIRCL vendor/product search ({ results: { feed: [[id, record], ...] } })
 $circl = new CirclSource();
 $cq = new Query(QueryType::Cpe, 'x', Cpe::parse('apache:log4j:2.14.1'));

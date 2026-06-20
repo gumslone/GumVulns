@@ -892,6 +892,34 @@ final class Http
 }
 
 /* -------------------------------------------------------------------------- */
+/* Configuration                                                              */
+/* -------------------------------------------------------------------------- */
+
+/** Runtime configuration (overridable base URLs, etc.). */
+final class Config
+{
+    /** Override for the CIRCL / vulnerability-lookup API base; null = use env/default. */
+    public static ?string $circlBase = null;
+
+    /**
+     * Base URL of the CIRCL-compatible API (cve.circl.lu or a self-hosted
+     * vulnerability-lookup instance). Precedence: explicit override > env
+     * CIRCL_API_URL > public default. Returned without a trailing slash.
+     */
+    public static function circlBase(): string
+    {
+        if (self::$circlBase !== null && self::$circlBase !== '') {
+            return rtrim(self::$circlBase, '/');
+        }
+        $env = getenv('CIRCL_API_URL');
+        if ($env !== false && $env !== '') {
+            return rtrim($env, '/');
+        }
+        return 'https://cve.circl.lu/api';
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /* Source contract                                                            */
 /* -------------------------------------------------------------------------- */
 
@@ -1081,16 +1109,17 @@ final class CirclSource extends VulnSource
 
     public function buildRequest(Query $q): ?HttpRequest
     {
-        $h = ['Accept: application/json'];
+        $h    = ['Accept: application/json'];
+        $base = Config::circlBase();
         if ($q->type === QueryType::CveId) {
-            return new HttpRequest('https://cve.circl.lu/api/cve/' . rawurlencode(strtoupper($q->raw)), 'GET', $h);
+            return new HttpRequest($base . '/cve/' . rawurlencode(strtoupper($q->raw)), 'GET', $h);
         }
         // CPE -> dedicated CPE search (needs a concrete vendor; wildcard returns {}).
         // The fkie_nvd feed carries CVSS + version ranges for (almost) every CVE,
         // unlike cvelistv5 which omits scores for many older records.
         if ($q->type === QueryType::Cpe && $q->cpe && $q->cpe->vendor !== '*' && $q->cpe->product !== '*') {
             return new HttpRequest(
-                'https://cve.circl.lu/api/vulnerability/cpesearch/' . rawurlencode($q->cpe->toQueryCpe23())
+                $base . '/vulnerability/cpesearch/' . rawurlencode($q->cpe->toQueryCpe23())
                     . '?per_page=50&page=1&source=fkie_nvd',
                 'GET', $h
             );
@@ -2110,7 +2139,7 @@ final class Aggregator
     private function circlBrowseRequest(string $vendor): HttpRequest
     {
         $req = new HttpRequest(
-            'https://cve.circl.lu/api/browse/' . rawurlencode(strtolower($vendor)),
+            Config::circlBase() . '/browse/' . rawurlencode(strtolower($vendor)),
             'GET',
             ['Accept: application/json']
         );
@@ -3000,12 +3029,16 @@ function gumvulns_search(string $input, array $options = []): array
     $opt = $options + [
         'cpe' => false, 'resolve_cpe' => true, 'sources' => null, 'limit' => null,
         'timeout' => 30, 'no_poc' => false, 'no_enrich' => false, 'no_cache' => false,
-        'osv_package' => null,
+        'osv_package' => null, 'circl_url' => null,
     ];
 
     $prevCache = Http::$cacheEnabled;
+    $prevCircl = Config::$circlBase;
     if ($opt['no_cache']) {
         Http::$cacheEnabled = false;
+    }
+    if ($opt['circl_url'] !== null && $opt['circl_url'] !== '') {
+        Config::$circlBase = (string) $opt['circl_url'];
     }
     try {
         $query = gumvulns_parse_query($input, (bool) $opt['cpe'], (bool) $opt['resolve_cpe']);
@@ -3112,6 +3145,7 @@ function gumvulns_search(string $input, array $options = []): array
         ];
     } finally {
         Http::$cacheEnabled = $prevCache;
+        Config::$circlBase  = $prevCircl;
     }
 }
 
@@ -3166,6 +3200,7 @@ function gumvulns_main(array $argv): int
     $osvSpec   = null;
     $noCpeResolve = false;
     $noCache   = false;
+    $circlUrl  = null;
     $timeout   = 30;
     $queryBits = [];
 
@@ -3184,6 +3219,8 @@ function gumvulns_main(array $argv): int
             $noCpeResolve = true;
         } elseif ($arg === '--no-cache') {
             $noCache = true;
+        } elseif (str_starts_with($arg, '--circl-url=')) {
+            $circlUrl = substr($arg, 12);
         } elseif (str_starts_with($arg, '--timeout=')) {
             $timeout = max(5, (int) substr($arg, 10));
         } elseif ($arg === '--list-sources') {
@@ -3220,6 +3257,7 @@ function gumvulns_main(array $argv): int
             'no_enrich'   => $noEnrich,
             'no_cache'    => $noCache,
             'osv_package' => $osvSpec,
+            'circl_url'   => $circlUrl,
         ]);
     } catch (InvalidArgumentException $e) {
         fwrite(STDERR, $e->getMessage() . "\n");
@@ -3279,6 +3317,8 @@ Options:
                       vendor:product via the NVD CPE dictionary.
   --timeout=SECONDS   Per-request network timeout (default 30; NVD gets longer).
   --no-cache          Don't use the on-disk response cache (NVD is cached 6h).
+  --circl-url=URL     Base URL of a self-hosted CIRCL-compatible API
+                      (vulnerability-lookup); also via env CIRCL_API_URL.
   --list-sources      List sources and whether they are enabled.
   -h, --help          Show this help.
 
