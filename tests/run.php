@@ -287,21 +287,24 @@ eq($out[1]->cveId, 'CVE-2', 'epss row cve id');
 
 // CIRCL vendor/product search ({ results: { feed: [[id, record], ...] } })
 $circl = new CirclSource();
-$cq = new Query(QueryType::Cpe, 'x', Cpe::parse('apache:log4j'));
+$cq = new Query(QueryType::Cpe, 'x', Cpe::parse('apache:log4j:2.14.1'));
 $creq = $circl->buildRequest($cq);
 ok($creq !== null && str_contains(rawurldecode($creq->url), '/api/vulnerability/cpesearch/cpe:2.3:a:apache:log4j'),
     'circl builds cpesearch url');
-$record = ['cveMetadata' => ['cveId' => 'CVE-2021-44228'], 'containers' => ['cna' => [
+ok(str_contains($creq->url, 'source=fkie_nvd'), 'circl uses fkie_nvd feed (has CVSS)');
+// cpesearch returns NVD-shaped records under the feed key.
+$nvdRec = ['id' => 'CVE-2021-44228',
     'descriptions' => [['lang' => 'en', 'value' => 'Log4Shell']],
-    'metrics' => [['cvssV3_1' => ['baseScore' => 10.0, 'baseSeverity' => 'CRITICAL',
-        'vectorString' => 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H']]],
-]]];
-$out = $circl->parse(resp(json_encode(['cvelistv5' => [$record]])), $cq);
+    'metrics' => ['cvssMetricV31' => [['cvssData' => ['baseScore' => 10.0, 'baseSeverity' => 'CRITICAL',
+        'vectorString' => 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H']]]],
+    'configurations' => [['nodes' => [['cpeMatch' => [[
+        'vulnerable' => true, 'criteria' => 'cpe:2.3:a:apache:log4j:*:*:*:*:*:*:*:*',
+        'versionStartIncluding' => '2.0', 'versionEndExcluding' => '2.15.0']]]]]]];
+$out = $circl->parse(resp(json_encode(['fkie_nvd' => [$nvdRec]])), $cq);
 eq($out[0]->cveId, 'CVE-2021-44228', 'circl cpesearch cve');
-eq($out[0]->score, 10.0, 'circl cpesearch score');
-// legacy { results: { feed: [[id, record]] } } shape still parses
-$out = $circl->parse(resp(json_encode(['results' => ['nvd' => [['cve-2021-44228', $record]]]])), $cq);
-eq($out[0]->cveId, 'CVE-2021-44228', 'circl legacy results shape');
+eq($out[0]->score, 10.0, 'circl cpesearch score (vector present)');
+eq($out[0]->vector, 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H', 'circl cpesearch vector');
+eq($out[0]->versions[0]->format(), 'log4j: >= 2.0, < 2.15.0', 'circl cpesearch version range');
 eq($circl->buildRequest(new Query(QueryType::Cpe, 'x', Cpe::parse('log4j'))), null, 'circl skips CPE search without vendor');
 
 // Red Hat product search (list of summary objects)

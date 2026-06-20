@@ -915,57 +915,29 @@ abstract class VulnSource
 /* Sources                                                                     */
 /* -------------------------------------------------------------------------- */
 
-/** NIST NVD — supports CVE id, keyword and CPE (virtualMatchString). */
-final class NvdSource extends VulnSource
+/**
+ * Maps an NVD 2.0 "cve" object (id, descriptions, metrics, configurations) into
+ * a Vulnerability. Shared by NVD and CIRCL (whose fkie_nvd feed uses the same
+ * shape). Requires the host class's get()/toFloat() helpers (VulnSource).
+ */
+trait NvdRecordMapper
 {
-    public function id(): string   { return 'nvd'; }
-    public function name(): string { return 'NVD (NIST)'; }
-
-    public function buildRequest(Query $q): ?HttpRequest
+    protected function mapNvdCve(array $cve, string $source): Vulnerability
     {
-        $base = 'https://services.nvd.nist.gov/rest/json/cves/2.0';
-        $url = match ($q->type) {
-            QueryType::CveId   => $base . '?cveId=' . rawurlencode(strtoupper($q->raw)),
-            QueryType::Keyword => $base . '?keywordSearch=' . rawurlencode($q->raw) . '&resultsPerPage=20',
-            QueryType::Cpe     => $base . '?virtualMatchString=' . rawurlencode($q->cpe->toQueryCpe23()) . '&resultsPerPage=50',
-        };
-
-        $headers = ['Accept: application/json'];
-        $key = getenv('NVD_API_KEY');
-        if ($key !== false && $key !== '') {
-            $headers[] = 'apiKey: ' . $key;
-        }
-        return new HttpRequest($url, 'GET', $headers);
-    }
-
-    public function parse(HttpResponse $resp, Query $q): array
-    {
-        if (!$resp->ok()) {
-            return [];
-        }
-        $data = $this->json($resp->body);
-        $out  = [];
-        foreach ($this->get($data, 'vulnerabilities', []) ?? [] as $item) {
-            $cve = $item['cve'] ?? null;
-            if (!is_array($cve)) {
-                continue;
+        $desc = '';
+        foreach ($this->get($cve, 'descriptions', []) ?? [] as $d) {
+            if (($d['lang'] ?? '') === 'en') {
+                $desc = $d['value'] ?? '';
+                break;
             }
-            $desc = '';
-            foreach ($this->get($cve, 'descriptions', []) ?? [] as $d) {
-                if (($d['lang'] ?? '') === 'en') {
-                    $desc = $d['value'] ?? '';
-                    break;
-                }
-            }
-            [$score, $severity, $vector] = $this->bestMetric($cve['metrics'] ?? []);
-            $ranges = $this->versionRanges($cve['configurations'] ?? []);
-            $out[] = new Vulnerability((string) ($cve['id'] ?? ''), $desc, $score, $severity, $vector, $this->name(), $ranges);
         }
-        return $out;
+        [$score, $severity, $vector] = $this->bestMetric($cve['metrics'] ?? []);
+        $ranges = $this->versionRanges($cve['configurations'] ?? []);
+        return new Vulnerability((string) ($cve['id'] ?? ''), $desc, $score, $severity, $vector, $source, $ranges);
     }
 
     /** @return VersionRange[] */
-    private function versionRanges(array $configurations): array
+    protected function versionRanges(array $configurations): array
     {
         $ranges = [];
         foreach ($configurations as $cfg) {
@@ -998,7 +970,8 @@ final class NvdSource extends VulnSource
         return $ranges;
     }
 
-    private function bestMetric(array $metrics): array
+    /** @return array{0:?float,1:string,2:string} [score, severity, vector] */
+    protected function bestMetric(array $metrics): array
     {
         foreach (['cvssMetricV31', 'cvssMetricV30'] as $k) {
             if (!empty($metrics[$k][0]['cvssData'])) {
@@ -1022,9 +995,53 @@ final class NvdSource extends VulnSource
     }
 }
 
-/** CIRCL CVE Search — CVE id (single) and CPE (vendor/product search). */
+/** NIST NVD — supports CVE id, keyword and CPE (virtualMatchString). */
+final class NvdSource extends VulnSource
+{
+    use NvdRecordMapper;
+
+    public function id(): string   { return 'nvd'; }
+    public function name(): string { return 'NVD (NIST)'; }
+
+    public function buildRequest(Query $q): ?HttpRequest
+    {
+        $base = 'https://services.nvd.nist.gov/rest/json/cves/2.0';
+        $url = match ($q->type) {
+            QueryType::CveId   => $base . '?cveId=' . rawurlencode(strtoupper($q->raw)),
+            QueryType::Keyword => $base . '?keywordSearch=' . rawurlencode($q->raw) . '&resultsPerPage=20',
+            QueryType::Cpe     => $base . '?virtualMatchString=' . rawurlencode($q->cpe->toQueryCpe23()) . '&resultsPerPage=50',
+        };
+
+        $headers = ['Accept: application/json'];
+        $key = getenv('NVD_API_KEY');
+        if ($key !== false && $key !== '') {
+            $headers[] = 'apiKey: ' . $key;
+        }
+        return new HttpRequest($url, 'GET', $headers);
+    }
+
+    public function parse(HttpResponse $resp, Query $q): array
+    {
+        if (!$resp->ok()) {
+            return [];
+        }
+        $data = $this->json($resp->body);
+        $out  = [];
+        foreach ($this->get($data, 'vulnerabilities', []) ?? [] as $item) {
+            $cve = $item['cve'] ?? null;
+            if (is_array($cve)) {
+                $out[] = $this->mapNvdCve($cve, $this->name());
+            }
+        }
+        return $out;
+    }
+}
+
+/** CIRCL CVE Search — CVE id (single record) and CPE (cpesearch, NVD feed). */
 final class CirclSource extends VulnSource
 {
+    use NvdRecordMapper;
+
     public function id(): string   { return 'circl'; }
     public function name(): string { return 'CIRCL CVE Search'; }
 
@@ -1035,10 +1052,12 @@ final class CirclSource extends VulnSource
             return new HttpRequest('https://cve.circl.lu/api/cve/' . rawurlencode(strtoupper($q->raw)), 'GET', $h);
         }
         // CPE -> dedicated CPE search (needs a concrete vendor; wildcard returns {}).
+        // The fkie_nvd feed carries CVSS + version ranges for (almost) every CVE,
+        // unlike cvelistv5 which omits scores for many older records.
         if ($q->type === QueryType::Cpe && $q->cpe && $q->cpe->vendor !== '*' && $q->cpe->product !== '*') {
             return new HttpRequest(
                 'https://cve.circl.lu/api/vulnerability/cpesearch/' . rawurlencode($q->cpe->toQueryCpe23())
-                    . '?per_page=50&page=1&source=cvelistv5',
+                    . '?per_page=50&page=1&source=fkie_nvd',
                 'GET', $h
             );
         }
@@ -1054,25 +1073,16 @@ final class CirclSource extends VulnSource
         if (!$data) {
             return [];
         }
-        // CPE search: { <feed>: [ <CVE 5.0 record>, ... ] } (also tolerate the
-        // legacy { results: { <feed>: [[id, record], ...] } } shape).
+        // CPE search returns NVD-shaped records under a per-feed key (fkie_nvd).
         if ($q->type === QueryType::Cpe) {
-            $buckets = isset($data['results']) && is_array($data['results']) ? $data['results'] : $data;
             $out = [];
-            foreach ($buckets as $bucket) {
+            foreach ($data as $bucket) {
                 if (!is_array($bucket)) {
                     continue;
                 }
-                foreach ($bucket as $item) {
-                    // Either a record directly, or an [id, record] pair.
-                    $record = (is_array($item) && (isset($item['containers']) || isset($item['cveMetadata'])))
-                        ? $item
-                        : (is_array($item) ? ($item[1] ?? null) : null);
-                    if (is_array($record)) {
-                        $v = $this->mapRecord($record, '');
-                        if ($v && $v->cveId !== 'N/A') {
-                            $out[] = $v;
-                        }
+                foreach ($bucket as $record) {
+                    if (is_array($record) && !empty($record['id'])) {
+                        $out[] = $this->mapNvdCve($record, $this->name());
                     }
                 }
             }
