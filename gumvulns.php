@@ -898,22 +898,25 @@ final class Http
 /** Runtime configuration (overridable base URLs, etc.). */
 final class Config
 {
-    /** Override for the CIRCL / vulnerability-lookup API base; null = use env/default. */
+    /** Override for the vulnerability-lookup API base; null = use env/default. */
     public static ?string $circlBase = null;
 
     /**
-     * Base URL of the CIRCL-compatible API (cve.circl.lu or a self-hosted
-     * vulnerability-lookup instance). Precedence: explicit override > env
-     * CIRCL_API_URL > public default. Returned without a trailing slash.
+     * Base URL of a vulnerability-lookup API (the software behind cve.circl.lu;
+     * https://github.com/vulnerability-lookup/vulnerability-lookup), e.g. a local
+     * install. Precedence: explicit override > env VULNERABILITY_LOOKUP_URL >
+     * env CIRCL_API_URL > public default. Returned without a trailing slash.
      */
     public static function circlBase(): string
     {
         if (self::$circlBase !== null && self::$circlBase !== '') {
             return rtrim(self::$circlBase, '/');
         }
-        $env = getenv('CIRCL_API_URL');
-        if ($env !== false && $env !== '') {
-            return rtrim($env, '/');
+        foreach (['VULNERABILITY_LOOKUP_URL', 'CIRCL_API_URL'] as $var) {
+            $env = getenv($var);
+            if ($env !== false && $env !== '') {
+                return rtrim($env, '/');
+            }
         }
         return 'https://cve.circl.lu/api';
     }
@@ -1112,7 +1115,9 @@ final class CirclSource extends VulnSource
         $h    = ['Accept: application/json'];
         $base = Config::circlBase();
         if ($q->type === QueryType::CveId) {
-            return new HttpRequest($base . '/cve/' . rawurlencode(strtoupper($q->raw)), 'GET', $h);
+            // Native vulnerability-lookup endpoint (works on a local install too;
+            // /api/cve/ is only a cve-search compatibility shim on cve.circl.lu).
+            return new HttpRequest($base . '/vulnerability/' . rawurlencode(strtoupper($q->raw)), 'GET', $h);
         }
         // CPE -> dedicated CPE search (needs a concrete vendor; wildcard returns {}).
         // The fkie_nvd feed carries CVSS + version ranges for (almost) every CVE,
@@ -3317,8 +3322,9 @@ Options:
                       vendor:product via the NVD CPE dictionary.
   --timeout=SECONDS   Per-request network timeout (default 30; NVD gets longer).
   --no-cache          Don't use the on-disk response cache (NVD is cached 6h).
-  --circl-url=URL     Base URL of a self-hosted CIRCL-compatible API
-                      (vulnerability-lookup); also via env CIRCL_API_URL.
+  --circl-url=URL     Base URL of a self-hosted vulnerability-lookup API
+                      (the software behind cve.circl.lu); also via env
+                      VULNERABILITY_LOOKUP_URL or CIRCL_API_URL.
   --list-sources      List sources and whether they are enabled.
   -h, --help          Show this help.
 

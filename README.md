@@ -342,16 +342,18 @@ per-request network timeout is `--timeout=SECONDS` (default 30).
 repeated query returns instantly instead of re-hitting NVD (in testing: a cold
 keyless call took ~34s, the cached call ~0.1s). Use `--no-cache` to bypass it.
 
-### Self-hosted CIRCL (vulnerability-lookup)
+### Self-hosted vulnerability-lookup (CIRCL)
 
-CIRCL's service is open source ([vulnerability-lookup](https://github.com/cve-search/vulnerability-lookup)),
-so you can point GumVulns at your own instance instead of `cve.circl.lu` — useful
-for air-gapped/offline use or to avoid rate limits. All CIRCL calls (CVE lookup,
-`cpesearch`, vendor `browse`) use the configured base:
+`cve.circl.lu` runs the open-source
+[vulnerability-lookup](https://github.com/vulnerability-lookup/vulnerability-lookup),
+so you can point GumVulns at your own local install — useful for air-gapped/
+offline use or to avoid rate limits. All CIRCL-source calls use the configured
+base via the **native** vulnerability-lookup endpoints (`/api/vulnerability/<id>`,
+`/api/vulnerability/cpesearch/<cpe>`, `/api/browse/<vendor>`):
 
 ```bash
 # environment variable
-export CIRCL_API_URL=http://localhost:8000/api
+export VULNERABILITY_LOOKUP_URL=http://localhost:8000/api   # CIRCL_API_URL also accepted
 # or per-invocation flag
 php gumvulns.php --cpe apache:log4j:2.14.1 --circl-url=http://localhost:8000/api
 ```
@@ -361,8 +363,8 @@ php gumvulns.php --cpe apache:log4j:2.14.1 --circl-url=http://localhost:8000/api
 $res = gumvulns_search('CVE-2021-44228', ['circl_url' => 'http://localhost:8000/api']);
 ```
 
-Precedence: `circl_url` option / `--circl-url` > `CIRCL_API_URL` env > the public
-default. The instance must expose the same API as `https://cve.circl.lu/api/`.
+Precedence: `circl_url` option / `--circl-url` > `VULNERABILITY_LOOKUP_URL` env >
+`CIRCL_API_URL` env > the public default (`https://cve.circl.lu/api`).
 
 ### EUVD (ENISA) and CVE Details
 
