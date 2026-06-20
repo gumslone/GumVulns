@@ -51,9 +51,12 @@ legacy **CPE 2.2 URI** (`cpe:/a:vendor:product:version`), or a bare **stub**
 It then:
 1. Parses the CPE into all 11 fields and prints the breakdown.
 2. Resolves the platform title from the **NVD CPE dictionary**.
-3. Returns **every matching CVE** from the CPE-capable sources (NVD
-   `virtualMatchString`, Shodan CVEDB, Vulners), **deduplicated by CVE id**.
-   Each row lists every source that reported it.
+3. Returns **every matching CVE** from all sources — directly from those that
+   support product search (NVD, Shodan, EUVD, Red Hat, Ubuntu, GitHub, Vulners)
+   and then by cross-referencing the discovered CVEs against the CVE-keyed ones
+   (see [Querying every source](#querying-every-source-cpe--purl--github)).
+   Results are **deduplicated by CVE id**; each row lists every source that
+   reported it.
 
 Results are ordered: **confirmed-vulnerable first** (when a version is given),
 then by **CVSS score**, and at the same score a CVE with a **known public
@@ -129,6 +132,39 @@ Results from both paths are merged and deduplicated by CVE id.
 
 > Owner/repo names don't always match NVD's CPE vendor/product strings, so the
 > commit path (OSV) is the precise one; the CPE path is best-effort.
+
+## Querying every source (CPE / purl / GitHub)
+
+For CPE, purl and GitHub-link queries GumVulns tries to reach **every** source,
+in two passes:
+
+**Phase 1 — native search.** Each input is converted to the parameters each API
+understands:
+
+| Source | Parameter built from the input |
+|---|---|
+| NVD | `virtualMatchString=cpe:2.3:…` |
+| Shodan CVEDB | `cpe23=…` (with version) or `product=…` |
+| EUVD | `product=` / `vendor=` |
+| Red Hat | `cve.json?product=<product>` |
+| Ubuntu | `cves.json?package=<product>` |
+| GitHub Advisory | `affects=<package>` (+ `ecosystem=` from a purl's type) |
+| Vulners | Lucene `affectedSoftware.name` |
+| OSV.dev | the purl / package (purl mode) or commit (GitHub commit) |
+
+**Phase 2 — cross-reference.** The CVEs discovered in phase 1 are then looked up
+in the sources that only answer by CVE id: **CISA KEV** (one feed download),
+**FIRST EPSS** (one batched request), **CIRCL**, **OSV**, **VulnCheck**, **CVE
+Details**. Everything is merged by CVE id, so each row lists every contributing
+source. Disable phase 2 with `--no-enrich`.
+
+> Phase 2 multiplies requests (one per CVE for the non-batch sources), so it
+> benefits from `GITHUB_TOKEN` / `NVD_API_KEY`. It runs on the results actually
+> shown (`--limit`, default 50).
+
+Two enrichment signals are kept separate from CVSS so they never distort the
+score: **EPSS** (exploit probability, shown on its own line / `epss` in JSON) and
+**KEV** (CISA known-exploited flag, shown next to severity / `kev` in JSON).
 
 ## Affected version ranges
 
@@ -229,18 +265,18 @@ parenthesized vectors). CVSS v4 vectors are surfaced but not yet scored.
 | Source | API key | CVE lookup | Keyword | CPE | Commit |
 |---|---|---|---|---|---|
 | NVD (NIST) | optional `NVD_API_KEY` | ✅ | ✅ | ✅ | — |
-| CIRCL CVE Search | — | ✅ | — | — | — |
-| Red Hat Security Data | — | ✅ | — | — | — |
+| CIRCL CVE Search | — | ✅ | — | phase 2 | — |
+| Red Hat Security Data | — | ✅ | — | ✅ (product) | — |
 | Shodan CVEDB | — | ✅ | — | ✅ | — |
-| Ubuntu Security | — | ✅ | — | — | — |
-| OSV.dev (Google) | — | ✅ | — | — | ✅ |
-| GitHub Advisory DB | optional `GITHUB_TOKEN` | ✅ | — | — | — |
-| CISA KEV (known-exploited) | — | ✅ | — | — | — |
-| FIRST EPSS (exploit probability) | — | ✅ | — | — | — |
+| Ubuntu Security | — | ✅ | — | ✅ (package) | — |
+| OSV.dev (Google) | — | ✅ | — | purl/pkg | ✅ |
+| GitHub Advisory DB | optional `GITHUB_TOKEN` | ✅ | — | ✅ (affects) | — |
+| CISA KEV (known-exploited) | — | ✅ | — | phase 2 | — |
+| FIRST EPSS (exploit probability) | — | ✅ | — | phase 2 | — |
 | EUVD (ENISA, EU database) | — | ✅ | ✅ | ✅ | — |
-| CVE Details (HTML scrape) | cookie, see below | ✅ | — | — | — |
+| CVE Details (HTML scrape) | cookie, see below | ✅ | — | phase 2 | — |
 | Vulners | `VULNERS_API_KEY` | ✅ | ✅ | ✅ | — |
-| VulnCheck | `VULNCHECK_API_KEY` | ✅ | — | — | — |
+| VulnCheck | `VULNCHECK_API_KEY` | ✅ | — | phase 2 | — |
 | Exploit/PoC indicators | — | enrichment (all modes) | | | |
 | endoflife.date | — | EOL status (with version) | | | |
 

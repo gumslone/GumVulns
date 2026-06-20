@@ -646,6 +646,9 @@ final class Vulnerability
     public ?string $matchedRange = null; // the range that matched, when vulnerable
     /** @var array<int,array{source:string,url:string}> Known public exploits/PoCs. */
     public array $exploits = [];
+    public ?float $epss = null;          // EPSS probability 0..1 (not a CVSS score)
+    public ?float $epssPercentile = null;
+    public bool $kev = false;            // listed in CISA KEV / flagged known-exploited
 
     /** @param VersionRange[] $versions */
     public function __construct(
@@ -725,6 +728,9 @@ final class Vulnerability
             'source'      => $this->source,
             'affected'    => array_map(static fn (VersionRange $r) => $r->toArray(), $this->versions),
             'exploits'    => $this->exploits,
+            'epss'        => $this->epss,
+            'epss_percentile' => $this->epssPercentile,
+            'kev'         => $this->kev,
         ];
         if ($this->versionChecked) {
             $out['vulnerable']    = $this->vulnerable;
@@ -1121,14 +1127,22 @@ final class RedHatSource extends VulnSource
 
     public function buildRequest(Query $q): ?HttpRequest
     {
-        if ($q->type !== QueryType::CveId) {
-            return null;
+        $h = ['Accept: application/json'];
+        if ($q->type === QueryType::CveId) {
+            return new HttpRequest(
+                'https://access.redhat.com/hydra/rest/securitydata/cve/' . rawurlencode(strtoupper($q->raw)) . '.json',
+                'GET', $h
+            );
         }
-        return new HttpRequest(
-            'https://access.redhat.com/hydra/rest/securitydata/cve/' . rawurlencode(strtoupper($q->raw)) . '.json',
-            'GET',
-            ['Accept: application/json']
-        );
+        // CPE -> product search.
+        if ($q->type === QueryType::Cpe && $q->cpe && $q->cpe->product !== '*') {
+            return new HttpRequest(
+                'https://access.redhat.com/hydra/rest/securitydata/cve.json?product='
+                . rawurlencode($q->cpe->product) . '&per_page=50',
+                'GET', $h
+            );
+        }
+        return null;
     }
 
     public function parse(HttpResponse $resp, Query $q): array
@@ -1137,7 +1151,28 @@ final class RedHatSource extends VulnSource
             return [];
         }
         $d = $this->json($resp->body);
-        if (!$d || empty($d['name'])) {
+        if (!$d) {
+            return [];
+        }
+        // Product search returns a list of summary objects.
+        if ($q->type === QueryType::Cpe) {
+            $out = [];
+            foreach ($d as $row) {
+                if (!is_array($row) || empty($row['CVE'])) {
+                    continue;
+                }
+                $out[] = new Vulnerability(
+                    (string) $row['CVE'],
+                    (string) ($row['bugzilla_description'] ?? ''),
+                    $this->toFloat($row['cvss3_score'] ?? null),
+                    (string) ($row['severity'] ?? ''),
+                    (string) ($row['cvss3_scoring_vector'] ?? ''),
+                    $this->name()
+                );
+            }
+            return $out;
+        }
+        if (empty($d['name'])) {
             return [];
         }
         $desc = $this->get($d, 'bugzilla.description', '') ?? '';
@@ -1207,14 +1242,13 @@ final class ShodanSource extends VulnSource
         }
         $score = $this->toFloat($d['cvss_v3'] ?? ($d['cvss'] ?? null));
         $desc  = (string) ($d['summary'] ?? '');
-        if (!empty($d['kev'])) {
-            $desc = '[KNOWN EXPLOITED] ' . $desc;
-        }
-        return new Vulnerability($id, $desc, $score, '', (string) ($d['cvss_v3_vector'] ?? ''), $this->name());
+        $v = new Vulnerability($id, $desc, $score, '', (string) ($d['cvss_v3_vector'] ?? ''), $this->name());
+        $v->kev = !empty($d['kev']);
+        return $v;
     }
 }
 
-/** Ubuntu Security CVE API (CVE id only). */
+/** Ubuntu Security CVE API (CVE id + package search). */
 final class UbuntuSource extends VulnSource
 {
     public function id(): string   { return 'ubuntu'; }
@@ -1222,14 +1256,20 @@ final class UbuntuSource extends VulnSource
 
     public function buildRequest(Query $q): ?HttpRequest
     {
-        if ($q->type !== QueryType::CveId) {
-            return null;
+        $h = ['Accept: application/json'];
+        if ($q->type === QueryType::CveId) {
+            return new HttpRequest(
+                'https://ubuntu.com/security/cves/' . rawurlencode(strtoupper($q->raw)) . '.json', 'GET', $h
+            );
         }
-        return new HttpRequest(
-            'https://ubuntu.com/security/cves/' . rawurlencode(strtoupper($q->raw)) . '.json',
-            'GET',
-            ['Accept: application/json']
-        );
+        // CPE -> package search.
+        if ($q->type === QueryType::Cpe && $q->cpe && $q->cpe->product !== '*') {
+            return new HttpRequest(
+                'https://ubuntu.com/security/cves.json?package=' . rawurlencode($q->cpe->product) . '&limit=50',
+                'GET', $h
+            );
+        }
+        return null;
     }
 
     public function parse(HttpResponse $resp, Query $q): array
@@ -1238,17 +1278,32 @@ final class UbuntuSource extends VulnSource
             return [];
         }
         $d = $this->json($resp->body);
-        if (!$d || empty($d['id'])) {
+        if (!$d) {
             return [];
         }
-        return [new Vulnerability(
+        // Package search returns { cves: [...] }.
+        if ($q->type === QueryType::Cpe) {
+            $out = [];
+            foreach ($this->get($d, 'cves', []) ?? [] as $row) {
+                if (is_array($row) && !empty($row['id'])) {
+                    $out[] = $this->map($row);
+                }
+            }
+            return $out;
+        }
+        return empty($d['id']) ? [] : [$this->map($d)];
+    }
+
+    private function map(array $d): Vulnerability
+    {
+        return new Vulnerability(
             (string) $d['id'],
             (string) ($d['description'] ?? ''),
             $this->toFloat($d['cvss3'] ?? null),
             (string) ($d['priority'] ?? ''),
             '',
             $this->name()
-        )];
+        );
     }
 }
 
@@ -1374,17 +1429,21 @@ final class OsvSource extends VulnSource
     }
 }
 
-/** GitHub Advisory Database (CVE id only). */
+/** GitHub Advisory Database (CVE id + package/ecosystem search). */
 final class GitHubSource extends VulnSource
 {
+    /** purl type -> GitHub advisory ecosystem. */
+    private const ECOSYSTEM = [
+        'maven' => 'maven', 'npm' => 'npm', 'pypi' => 'pip', 'gem' => 'rubygems',
+        'golang' => 'go', 'go' => 'go', 'cargo' => 'rust', 'composer' => 'composer',
+        'nuget' => 'nuget', 'hex' => 'erlang', 'pub' => 'pub', 'swift' => 'swift',
+    ];
+
     public function id(): string   { return 'github'; }
     public function name(): string { return 'GitHub Advisory'; }
 
     public function buildRequest(Query $q): ?HttpRequest
     {
-        if ($q->type !== QueryType::CveId) {
-            return null;
-        }
         $headers = [
             'Accept: application/vnd.github+json',
             'X-GitHub-Api-Version: 2022-11-28',
@@ -1394,11 +1453,44 @@ final class GitHubSource extends VulnSource
         if ($token !== false && $token !== '') {
             $headers[] = 'Authorization: Bearer ' . $token;
         }
-        return new HttpRequest(
-            'https://api.github.com/advisories?cve_id=' . rawurlencode(strtoupper($q->raw)),
-            'GET',
-            $headers
-        );
+        if ($q->type === QueryType::CveId) {
+            return new HttpRequest(
+                'https://api.github.com/advisories?cve_id=' . rawurlencode(strtoupper($q->raw)),
+                'GET', $headers
+            );
+        }
+        // CPE/purl -> affected-package search.
+        if ($q->type === QueryType::Cpe) {
+            $params = $this->affectsParams($q);
+            if ($params === null) {
+                return null;
+            }
+            return new HttpRequest('https://api.github.com/advisories?' . http_build_query($params) . '&per_page=50',
+                'GET', $headers);
+        }
+        return null;
+    }
+
+    /** Build the affects (+ ecosystem) query from a purl when available, else the CPE product. */
+    private function affectsParams(Query $q): ?array
+    {
+        if ($q->purl !== null) {
+            $type = $q->purl['type'];
+            $name = $q->purl['name'];
+            $ns   = $q->purl['namespace'];
+            $pkg  = $ns !== null && $ns !== ''
+                ? $ns . ($type === 'maven' ? ':' : '/') . $name
+                : $name;
+            $params = ['affects' => $pkg];
+            if (isset(self::ECOSYSTEM[$type])) {
+                $params['ecosystem'] = self::ECOSYSTEM[$type];
+            }
+            return $params;
+        }
+        if ($q->cpe && $q->cpe->product !== '*') {
+            return ['affects' => $q->cpe->product];
+        }
+        return null;
     }
 
     public function parse(HttpResponse $resp, Query $q): array
@@ -1480,20 +1572,41 @@ final class CisaKevSource extends VulnSource
 
     public function parse(HttpResponse $resp, Query $q): array
     {
+        return $this->parseBatch($resp, [strtoupper($q->raw)]);
+    }
+
+    /** One feed download serves any number of CVEs (used by enrichment). */
+    public function buildBatchRequest(array $cveIds): HttpRequest
+    {
+        return new HttpRequest(
+            'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json',
+            'GET',
+            ['Accept: application/json']
+        );
+    }
+
+    /** @param string[] $cveIds @return Vulnerability[] */
+    public function parseBatch(HttpResponse $resp, array $cveIds): array
+    {
         if (!$resp->ok()) {
             return [];
         }
-        $want = strtoupper($q->raw);
+        $want = array_flip(array_map('strtoupper', $cveIds));
+        $out  = [];
         foreach ($this->get($this->json($resp->body), 'vulnerabilities', []) ?? [] as $v) {
-            if (strtoupper((string) ($v['cveID'] ?? '')) === $want) {
-                $desc = trim(($v['vulnerabilityName'] ?? '') . ' — ' . ($v['shortDescription'] ?? ''));
-                if (!empty($v['requiredAction'])) {
-                    $desc .= ' Required action: ' . $v['requiredAction'];
-                }
-                return [new Vulnerability($want, $desc, null, 'KNOWN EXPLOITED', '', $this->name())];
+            $id = strtoupper((string) ($v['cveID'] ?? ''));
+            if (!isset($want[$id])) {
+                continue;
             }
+            $desc = trim(($v['vulnerabilityName'] ?? '') . ' — ' . ($v['shortDescription'] ?? ''));
+            if (!empty($v['requiredAction'])) {
+                $desc .= ' Required action: ' . $v['requiredAction'];
+            }
+            $vuln = new Vulnerability($id, $desc, null, 'KNOWN EXPLOITED', '', $this->name());
+            $vuln->kev = true;
+            $out[] = $vuln;
         }
-        return [];
+        return $out;
     }
 }
 
@@ -1508,8 +1621,15 @@ final class EpssSource extends VulnSource
         if ($q->type !== QueryType::CveId) {
             return null;
         }
+        return $this->buildBatchRequest([strtoupper($q->raw)]);
+    }
+
+    /** EPSS accepts a comma-separated list of CVEs in one request. */
+    public function buildBatchRequest(array $cveIds): HttpRequest
+    {
+        $list = implode(',', array_map('strtoupper', array_slice($cveIds, 0, 100)));
         return new HttpRequest(
-            'https://api.first.org/data/v1/epss?cve=' . rawurlencode(strtoupper($q->raw)),
+            'https://api.first.org/data/v1/epss?cve=' . rawurlencode($list),
             'GET',
             ['Accept: application/json']
         );
@@ -1520,19 +1640,27 @@ final class EpssSource extends VulnSource
         if (!$resp->ok()) {
             return [];
         }
-        $rows = $this->get($this->json($resp->body), 'data', []) ?? [];
-        if (!$rows) {
-            return [];
+        $out = [];
+        foreach ($this->get($this->json($resp->body), 'data', []) ?? [] as $row) {
+            $cve = strtoupper((string) ($row['cve'] ?? $q->raw));
+            if ($cve === '') {
+                continue;
+            }
+            $epss       = $this->toFloat($row['epss'] ?? null);
+            $percentile = $this->toFloat($row['percentile'] ?? null);
+            $pct        = $epss !== null ? round($epss * 100, 2) : 0.0;
+            $desc = sprintf(
+                'Exploit probability (next 30 days): %s%%%s',
+                $pct,
+                $percentile !== null ? sprintf(' (percentile %.2f)', $percentile * 100) : ''
+            );
+            // EPSS is a probability, not a CVSS score — keep it off score/severity.
+            $v = new Vulnerability($cve, $desc, null, '', '', $this->name());
+            $v->epss = $epss;
+            $v->epssPercentile = $percentile;
+            $out[] = $v;
         }
-        $epss       = $this->toFloat($rows[0]['epss'] ?? null);
-        $percentile = $this->toFloat($rows[0]['percentile'] ?? null);
-        $pct        = $epss !== null ? round($epss * 100, 2) : 0.0;
-        $desc = sprintf(
-            'Exploit probability (next 30 days): %s%%%s',
-            $pct,
-            $percentile !== null ? sprintf(' (percentile %.2f)', $percentile * 100) : ''
-        );
-        return [new Vulnerability(strtoupper($q->raw), $desc, $epss !== null ? round($epss * 10, 2) : null, 'EPSS', '', $this->name())];
+        return $out;
     }
 }
 
@@ -1912,7 +2040,87 @@ final class Aggregator
             'results'     => $results,
             'diagnostics' => $diagnostics,
             'cpe_meta'    => $responses['__cpe_meta'] ?? null,
+            'ran'         => array_keys($jobs),
         ];
+    }
+
+    /**
+     * Cross-reference a set of CVE ids against every CVE-keyed source that did
+     * NOT already run (by id in $skipIds). Bulk sources (CISA KEV feed, EPSS
+     * batch) make a single request; the rest do one request per CVE. All run
+     * in one parallel batch.
+     *
+     * @param string[] $cveIds
+     * @param string[] $skipIds
+     * @return array{results: Vulnerability[], diagnostics: array<int,array<string,mixed>>}
+     */
+    public function enrich(array $cveIds, array $skipIds): array
+    {
+        $cveIds = array_values(array_unique(array_filter(
+            array_map('strtoupper', $cveIds),
+            static fn ($c) => (bool) preg_match('/^CVE-\d{4}-\d{4,}$/', $c)
+        )));
+        if (!$cveIds) {
+            return ['results' => [], 'diagnostics' => []];
+        }
+        $skip = array_flip($skipIds);
+
+        $reqs = [];   // key => HttpRequest
+        $plan = [];   // key => ['src'=>VulnSource,'cve'=>?string,'batch'=>bool]
+        foreach ($this->sources as $src) {
+            if (!$src->isEnabled() || isset($skip[$src->id()])) {
+                continue;
+            }
+            // Only sources that can answer a CVE-id query.
+            if ($src->buildRequest(new Query(QueryType::CveId, $cveIds[0])) === null) {
+                continue;
+            }
+            if (method_exists($src, 'buildBatchRequest')) {
+                $key = $src->id() . '|batch';
+                $reqs[$key] = $src->buildBatchRequest($cveIds);
+                $plan[$key] = ['src' => $src, 'cve' => null, 'batch' => true];
+            } else {
+                foreach ($cveIds as $cve) {
+                    $key = $src->id() . '|' . $cve;
+                    $reqs[$key] = $src->buildRequest(new Query(QueryType::CveId, $cve));
+                    $plan[$key] = ['src' => $src, 'cve' => $cve, 'batch' => false];
+                }
+            }
+        }
+        if (!$reqs) {
+            return ['results' => [], 'diagnostics' => []];
+        }
+
+        $responses = Http::parallel($reqs, $this->timeout);
+
+        $results = [];
+        $counts  = []; // source name => count
+        foreach ($plan as $key => $p) {
+            $src  = $p['src'];
+            $resp = $responses[$key];
+            $vs   = [];
+            try {
+                if ($p['batch']) {
+                    $vs = method_exists($src, 'parseBatch')
+                        ? $src->parseBatch($resp, $cveIds)
+                        : $src->parse($resp, new Query(QueryType::CveId, ''));
+                } elseif ($resp->error === '') {
+                    $vs = $src->parse($resp, new Query(QueryType::CveId, (string) $p['cve']));
+                }
+            } catch (\Throwable $e) {
+                $vs = [];
+            }
+            foreach ($vs as $v) {
+                $results[] = $v;
+            }
+            $counts[$src->name()] = ($counts[$src->name()] ?? 0) + count($vs);
+        }
+
+        $diagnostics = [];
+        foreach ($counts as $name => $n) {
+            $diagnostics[] = ['source' => $name . ' (enrich)', 'status' => 200, 'count' => $n, 'error' => ''];
+        }
+        return ['results' => $results, 'diagnostics' => $diagnostics];
     }
 
     private function cpeMetaRequest(Cpe $cpe): HttpRequest
@@ -2199,6 +2407,11 @@ final class Merger
             }
             // Union the affected version ranges reported by each source.
             $cur->versions = Vulnerability::dedupeRanges(array_merge($cur->versions, $v->versions));
+            // Carry over enrichment signals.
+            $cur->exploits = array_merge($cur->exploits, $v->exploits);
+            $cur->epss           = $cur->epss ?? $v->epss;
+            $cur->epssPercentile = $cur->epssPercentile ?? $v->epssPercentile;
+            $cur->kev            = $cur->kev || $v->kev;
         }
 
         foreach ($byCve as $key => $v) {
@@ -2257,7 +2470,11 @@ final class Renderer
             $out .= self::row('CVE',         $v->cveId);
             $out .= self::row('Source',      $v->source);
             $out .= self::row('Score',       $score);
-            $out .= self::row('Severity',    $v->severity);
+            $out .= self::row('Severity',    $v->severity . ($v->kev ? '  [KEV: known exploited]' : ''));
+            if ($v->epss !== null) {
+                $out .= self::row('EPSS', sprintf('%.1f%% probability%s', $v->epss * 100,
+                    $v->epssPercentile !== null ? sprintf(' (percentile %.1f)', $v->epssPercentile * 100) : ''));
+            }
             if ($v->versionChecked) {
                 $out .= self::row('Status', self::status($v));
             }
@@ -2641,6 +2858,7 @@ function gumvulns_main(array $argv): int
     $asJson    = false;
     $forceCpe  = false;
     $noPoc     = false;
+    $noEnrich  = false;
     $only      = null;
     $limit     = null;
     $osvSpec   = null;
@@ -2654,6 +2872,8 @@ function gumvulns_main(array $argv): int
             $forceCpe = true;
         } elseif ($arg === '--no-poc') {
             $noPoc = true;
+        } elseif ($arg === '--no-enrich') {
+            $noEnrich = true;
         } elseif (str_starts_with($arg, '--osv-package=')) {
             $osvSpec = substr($arg, 14);
         } elseif ($arg === '--no-cpe-resolve') {
@@ -2703,13 +2923,26 @@ function gumvulns_main(array $argv): int
         }
     }
 
-    $res     = (new Aggregator($sources))->search($query);
+    $agg     = new Aggregator($sources);
+    $res     = $agg->search($query);
     $results = $res['results'];
 
     // CPE mode: collapse to one row per CVE and apply a sane default cap.
     if ($query->type === QueryType::Cpe) {
         $results = Merger::mergeByCve($results);
         $limit   = $limit ?? 50;
+
+        // Phase 2: cross-reference the discovered CVEs against the remaining
+        // CVE-keyed sources (CISA KEV, EPSS, CIRCL, OSV, VulnCheck, CVE Details).
+        if (!$noEnrich && $results) {
+            $top     = array_slice(Merger::orderForCpe($results), 0, $limit);
+            $cveIds  = array_map(static fn (Vulnerability $v) => $v->cveId, $top);
+            $enr     = $agg->enrich($cveIds, $res['ran']);
+            if ($enr['results']) {
+                $results = Merger::mergeByCve(array_merge($results, $enr['results']));
+            }
+            $res['diagnostics'] = array_merge($res['diagnostics'], $enr['diagnostics']);
+        }
     }
     // Flag whether the queried version is inside any affected range.
     $targetVersion = ($query->cpe && $query->cpe->hasVersion()) ? $query->cpe->version : null;
@@ -2834,6 +3067,8 @@ Options:
   --limit=N           Cap results (default 50 in CPE mode).
   --no-poc            Skip exploit/PoC enrichment (Nuclei, Exploit-DB,
                       Metasploit, PoC-in-GitHub).
+  --no-enrich         Skip phase-2 cross-referencing of discovered CVEs against
+                      the remaining CVE-keyed sources (CPE/purl/GitHub modes).
   --osv-package=SPEC  Add an OSV package query, merged into the results.
                       SPEC = ecosystem:name[@version] or a purl. Version
                       defaults to the CPE version when one is given.

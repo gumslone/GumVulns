@@ -245,7 +245,7 @@ $shJson = json_encode(['cve_id' => 'CVE-2021-44228', 'summary' => 'Log4Shell',
     'cvss_v3' => 10.0, 'cvss_v3_vector' => 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H', 'kev' => true]);
 $out = $shodan->parse(resp($shJson), new Query(QueryType::CveId, 'CVE-2021-44228'));
 eq($out[0]->score, 10.0, 'shodan score');
-ok(str_contains($out[0]->description, 'KNOWN EXPLOITED'), 'shodan KEV marker');
+ok($out[0]->kev, 'shodan sets KEV flag');
 
 // EUVD (alias filter in CVE mode + raw product range)
 $euvd = new EuvdSource();
@@ -269,12 +269,54 @@ $cisaJson = json_encode(['vulnerabilities' => [[
 $out = $cisa->parse(resp($cisaJson), new Query(QueryType::CveId, 'CVE-2021-44228'));
 eq($out[0]->severity, 'KNOWN EXPLOITED', 'cisa severity');
 
-// EPSS
+// EPSS (probability lives in its own field, not score/severity)
 $epss = new EpssSource();
-$out = $epss->parse(resp(json_encode(['data' => [['epss' => 0.5, 'percentile' => 0.9]]])),
+$out = $epss->parse(resp(json_encode(['data' => [['cve' => 'CVE-2021-44228', 'epss' => 0.5, 'percentile' => 0.9]]])),
     new Query(QueryType::CveId, 'CVE-2021-44228'));
-eq($out[0]->score, 5.0, 'epss scaled score');
-ok(str_contains($out[0]->description, '50%'), 'epss probability text');
+eq($out[0]->score, null, 'epss does not set a CVSS score');
+eq($out[0]->epss, 0.5, 'epss probability field');
+eq($out[0]->epssPercentile, 0.9, 'epss percentile field');
+
+// EPSS batch (multiple rows in one response)
+$out = $epss->parse(resp(json_encode(['data' => [
+    ['cve' => 'CVE-1', 'epss' => 0.1, 'percentile' => 0.2],
+    ['cve' => 'CVE-2', 'epss' => 0.3, 'percentile' => 0.4],
+]])), new Query(QueryType::CveId, ''));
+eq(count($out), 2, 'epss parses multiple rows');
+eq($out[1]->cveId, 'CVE-2', 'epss row cve id');
+
+// Red Hat product search (list of summary objects)
+$rh = new RedHatSource();
+$rhJson = json_encode([
+    ['CVE' => 'CVE-2021-44228', 'severity' => 'critical', 'bugzilla_description' => 'log4j RCE',
+     'cvss3_score' => '10.0', 'cvss3_scoring_vector' => 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H'],
+]);
+$out = $rh->parse(resp($rhJson), new Query(QueryType::Cpe, 'x', Cpe::parse('apache:log4j')));
+eq($out[0]->cveId, 'CVE-2021-44228', 'redhat product result cve');
+eq($out[0]->score, 10.0, 'redhat product result score');
+
+// Ubuntu package search ({cves:[...]})
+$ub = new UbuntuSource();
+$ubJson = json_encode(['cves' => [['id' => 'CVE-2021-44228', 'description' => 'd', 'cvss3' => 10.0, 'priority' => 'critical']]]);
+$out = $ub->parse(resp($ubJson), new Query(QueryType::Cpe, 'x', Cpe::parse('apache:log4j')));
+eq($out[0]->cveId, 'CVE-2021-44228', 'ubuntu package result cve');
+
+// GitHub affects/ecosystem params from a purl
+$ghs = new GitHubSource();
+$qp = gumvulns_parse_query('pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1', false, false);
+$req = $ghs->buildRequest($qp);
+ok($req !== null && str_contains($req->url, 'ecosystem=maven'), 'github maps purl type -> ecosystem');
+ok(str_contains(rawurldecode($req->url), 'org.apache.logging.log4j:log4j-core'), 'github affects = maven coordinate');
+
+// CISA batch (parseBatch over feed for a set)
+$kev = new CisaKevSource();
+$kevJson = json_encode(['vulnerabilities' => [
+    ['cveID' => 'CVE-2021-44228', 'vulnerabilityName' => 'Log4Shell', 'shortDescription' => 'RCE'],
+    ['cveID' => 'CVE-0000-0000', 'vulnerabilityName' => 'x', 'shortDescription' => 'y'],
+]]);
+$out = $kev->parseBatch(resp($kevJson), ['CVE-2021-44228', 'CVE-9999-9999']);
+eq(count($out), 1, 'cisa parseBatch filters to wanted set');
+ok($out[0]->kev, 'cisa sets kev flag');
 
 // CVE Details HTML scrape + Cloudflare detection
 $cd = new CveDetailsSource();
@@ -297,6 +339,16 @@ eq(count($merged), 1, 'merge collapses same CVE');
 eq($merged[0]->source, 'NVD (NIST), OSV.dev', 'merge lists both sources');
 eq(count($merged[0]->versions), 2, 'merge unions ranges');
 ok(str_contains($merged[0]->description, 'longer'), 'merge keeps richest description');
+
+// merge carries EPSS/KEV signals without polluting CVSS score/severity
+$cvss = new Vulnerability('CVE-9', '', 9.8, 'CRITICAL', '', 'NVD (NIST)');
+$ep = new Vulnerability('CVE-9', '', null, '', '', 'FIRST EPSS'); $ep->epss = 0.97;
+$kv = new Vulnerability('CVE-9', '', null, 'KNOWN EXPLOITED', '', 'CISA KEV'); $kv->kev = true;
+$m2 = Merger::mergeByCve([$cvss, $ep, $kv]);
+eq($m2[0]->score, 9.8, 'merge keeps real CVSS score (not EPSS)');
+eq($m2[0]->severity, 'CRITICAL', 'merge keeps real severity (not EPSS/KEV)');
+eq($m2[0]->epss, 0.97, 'merge carries EPSS probability');
+ok($m2[0]->kev, 'merge carries KEV flag');
 
 // orderForCpe: exploit breaks ties at same score; vulnerable-first when checked
 $x = new Vulnerability('CVE-A', '', 7.5, '', '', 's');
