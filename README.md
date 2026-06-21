@@ -313,6 +313,24 @@ score and qualitative severity are computed from the vector with a built-in
 calculator that supports **CVSS v2 and v3.0/v3.1** (prefixed, bare, or
 parenthesized vectors). CVSS v4 vectors are surfaced but not yet scored.
 
+When more than one CVSS version is available for a CVE, **each version is kept
+separately** (not just the "best" one). The table shows a row per version and the
+`--json` output adds `cvss2` / `cvss3` / `cvss4` objects, each with `score`,
+`vector`, and `status` (severity):
+
+```
+CVSS v3:  9.8 CRITICAL  CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H
+CVSS v2:  6.8 MEDIUM    AV:N/AC:M/Au:N/C:P/I:P/A:P
+```
+```json
+"cvss3": { "score": 9.8, "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", "status": "CRITICAL" },
+"cvss2": { "score": 6.8, "vector": "AV:N/AC:M/Au:N/C:P/I:P/A:P", "status": "MEDIUM" }
+```
+
+The top-level `score`/`severity`/`vector` remain the primary (highest available
+version); per-version entries are merged across sources, preferring ones that
+carry a vector.
+
 ## Sources
 
 | Source | API key | CVE lookup | Keyword | CPE | Commit |

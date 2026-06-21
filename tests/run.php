@@ -428,6 +428,41 @@ Http::$cacheEnabled = true;
 @unlink(Http::cachePath($creq2));
 
 /* -------------------------------------------------------------------------- */
+section('Per-version CVSS (cvss2/3/4)');
+
+eq(Cvss::version('CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H'), '3', 'detect v3 from prefix');
+eq(Cvss::version('CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N'), '4', 'detect v4 from prefix');
+eq(Cvss::version('AV:N/AC:M/Au:N/C:P/I:P/A:P'), '2', 'detect v2 from Au metric');
+eq(Cvss::version('not a vector'), null, 'detect version null');
+
+// Constructor auto-records the primary vector under its version.
+$one = new Vulnerability('CVE-Z', '', null, '', 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H', 's');
+eq($one->cvss['3']['score'], 10.0, 'auto cvss3 score from vector');
+eq($one->cvss['3']['status'], 'CRITICAL', 'auto cvss3 status');
+
+// NVD parse captures v2 and v3 separately.
+$nvd = new NvdSource();
+$cve = ['id' => 'CVE-MV', 'descriptions' => [['lang' => 'en', 'value' => 'x']], 'metrics' => [
+    'cvssMetricV31' => [['cvssData' => ['baseScore' => 9.8, 'baseSeverity' => 'CRITICAL',
+        'vectorString' => 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H']]],
+    'cvssMetricV2'  => [['baseSeverity' => 'MEDIUM', 'cvssData' => ['baseScore' => 6.8,
+        'vectorString' => 'AV:N/AC:M/Au:N/C:P/I:P/A:P']]],
+]];
+$out = $nvd->parse(resp(json_encode(['vulnerabilities' => [['cve' => $cve]]])), new Query(QueryType::CveId, 'CVE-MV'));
+$arr = $out[0]->toArray();
+eq($arr['cvss3']['score'], 9.8, 'nvd cvss3 score');
+eq($arr['cvss3']['status'], 'CRITICAL', 'nvd cvss3 status');
+eq($arr['cvss2']['score'], 6.8, 'nvd cvss2 score');
+eq($arr['cvss2']['vector'], 'AV:N/AC:M/Au:N/C:P/I:P/A:P', 'nvd cvss2 vector');
+
+// Merge unions per-version CVSS, preferring entries with a vector.
+$x = new Vulnerability('CVE-M', '', 9.8, 'CRITICAL', 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H', 'NVD (NIST)');
+$y = new Vulnerability('CVE-M', '', null, '', '', 'OSV.dev');
+$y->addCvss('2', 6.8, 'AV:N/AC:M/Au:N/C:P/I:P/A:P', 'MEDIUM');
+$m = Merger::mergeByCve([$x, $y]);
+ok(isset($m[0]->cvss['3'], $m[0]->cvss['2']), 'merge unions cvss versions');
+
+/* -------------------------------------------------------------------------- */
 section('Library API (gumvulns_search / gumvulns_payload)');
 
 // Validation happens before any network call, so these are offline-safe.

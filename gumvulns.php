@@ -407,6 +407,19 @@ final class Cvss
         return null; // v4 and unknown formats are not scored here.
     }
 
+    /** Detect the CVSS major version ("2","3","4") from a vector, or null. */
+    public static function version(string $vector): ?string
+    {
+        $v = trim($vector, " \t()");
+        if (preg_match('/^CVSS:4\.\d/', $v)) return '4';
+        if (preg_match('/^CVSS:3\.[01]/', $v)) return '3';
+        if (preg_match('/^CVSS:2/', $v)) return '2';
+        $m = self::metrics($v);
+        if (isset($m['PR'], $m['UI'])) return '3';
+        if (isset($m['Au'])) return '2';
+        return null;
+    }
+
     /** @return array<string,string> */
     private static function metrics(string $vector): array
     {
@@ -649,6 +662,8 @@ final class Vulnerability
     public ?float $epss = null;          // EPSS probability 0..1 (not a CVSS score)
     public ?float $epssPercentile = null;
     public bool $kev = false;            // listed in CISA KEV / flagged known-exploited
+    /** @var array<string,array{score:?float,vector:string,status:string}> per-version CVSS, keyed "2"/"3"/"4". */
+    public array $cvss = [];
 
     /** @param VersionRange[] $versions */
     public function __construct(
@@ -671,6 +686,34 @@ final class Vulnerability
         $this->severity    = $severity !== '' ? strtoupper($severity) : self::severityFromScore($score);
         $this->source      = $source;
         $this->versions    = self::dedupeRanges($versions);
+        // Record the primary metric under its CVSS version (best-effort).
+        if ($this->vector !== '') {
+            $this->addCvss(Cvss::version($this->vector) ?? '', $this->score, $this->vector, $this->severity);
+        }
+    }
+
+    /**
+     * Record a CVSS metric for a specific version ("2"/"3"/"4"). Missing scores
+     * are computed from the vector (v2/v3); a richer existing entry (with a
+     * vector) is not overwritten by a barer one.
+     */
+    public function addCvss(string $version, ?float $score, string $vector, string $status = ''): void
+    {
+        if (!in_array($version, ['2', '3', '4'], true)) {
+            return;
+        }
+        $vector = trim($vector);
+        if ($score === null && $vector !== '') {
+            $score = Cvss::baseScore($vector);
+        }
+        if ($status === '') {
+            $status = self::severityFromScore($score);
+        }
+        $existing = $this->cvss[$version] ?? null;
+        if ($existing !== null && $existing['vector'] !== '' && $vector === '') {
+            return;
+        }
+        $this->cvss[$version] = ['score' => $score, 'vector' => $vector, 'status' => strtoupper($status)];
     }
 
     /**
@@ -732,6 +775,11 @@ final class Vulnerability
             'epss_percentile' => $this->epssPercentile,
             'kev'         => $this->kev,
         ];
+        foreach (['2', '3', '4'] as $ver) {
+            if (isset($this->cvss[$ver])) {
+                $out['cvss' . $ver] = $this->cvss[$ver];
+            }
+        }
         if ($this->versionChecked) {
             $out['vulnerable']    = $this->vulnerable;
             $out['matched_range'] = $this->matchedRange;
@@ -994,7 +1042,24 @@ trait NvdRecordMapper
         }
         [$score, $severity, $vector] = $this->bestMetric($cve['metrics'] ?? []);
         $ranges = $this->versionRanges($cve['configurations'] ?? []);
-        return new Vulnerability((string) ($cve['id'] ?? ''), $desc, $score, $severity, $vector, $source, $ranges);
+        $v = new Vulnerability((string) ($cve['id'] ?? ''), $desc, $score, $severity, $vector, $source, $ranges);
+        $this->addNvdMetrics($v, $cve['metrics'] ?? []);
+        return $v;
+    }
+
+    /** Record every CVSS version present in an NVD metrics block. */
+    protected function addNvdMetrics(Vulnerability $v, array $metrics): void
+    {
+        // V3.0 then V3.1 so the richer 3.1 wins the "3" slot.
+        foreach (['cvssMetricV2' => '2', 'cvssMetricV30' => '3', 'cvssMetricV31' => '3', 'cvssMetricV40' => '4'] as $k => $ver) {
+            if (empty($metrics[$k][0]['cvssData'])) {
+                continue;
+            }
+            $entry = $metrics[$k][0];
+            $c     = $entry['cvssData'];
+            $sev   = (string) ($c['baseSeverity'] ?? ($entry['baseSeverity'] ?? '')); // v2 severity sits outside cvssData
+            $v->addCvss($ver, isset($c['baseScore']) ? (float) $c['baseScore'] : null, (string) ($c['vectorString'] ?? ''), $sev);
+        }
     }
 
     /** @return VersionRange[] */
@@ -1177,10 +1242,13 @@ final class CirclSource extends VulnSource
             $desc = (string) ($data['summary'] ?? '');
         }
         [$score, $severity, $vector] = $this->metrics($cna, $data);
-        return new Vulnerability((string) $id, $desc, $score, $severity, $vector, $this->name());
+        $v = new Vulnerability((string) $id, $desc, $score, $severity, $vector, $this->name());
+        $this->addAllMetrics($v, $cna, $data);
+        return $v;
     }
 
-    private function metrics(array $cna, array $root): array
+    /** @return array<int,array<string,mixed>> all CVSS metric buckets (cna + adp). */
+    private function buckets(array $cna, array $root): array
     {
         $buckets = $this->get($cna, 'metrics', []) ?? [];
         foreach ($this->get($root, 'containers.adp', []) ?? [] as $adp) {
@@ -1188,10 +1256,15 @@ final class CirclSource extends VulnSource
                 $buckets[] = $m;
             }
         }
-        foreach (['cvssV3_1', 'cvssV3_0', 'cvssV4_0', 'cvssV2_0'] as $ver) {
-            foreach ($buckets as $m) {
-                if (!empty($m[$ver])) {
-                    $c = $m[$ver];
+        return $buckets;
+    }
+
+    private function metrics(array $cna, array $root): array
+    {
+        foreach (['cvssV3_1', 'cvssV3_0', 'cvssV4_0', 'cvssV2_0'] as $key) {
+            foreach ($this->buckets($cna, $root) as $m) {
+                if (!empty($m[$key])) {
+                    $c = $m[$key];
                     return [
                         $this->toFloat($c['baseScore'] ?? null),
                         (string) ($c['baseSeverity'] ?? ''),
@@ -1201,6 +1274,20 @@ final class CirclSource extends VulnSource
             }
         }
         return [null, '', ''];
+    }
+
+    private function addAllMetrics(Vulnerability $v, array $cna, array $root): void
+    {
+        $buckets = $this->buckets($cna, $root);
+        foreach (['cvssV2_0' => '2', 'cvssV3_0' => '3', 'cvssV3_1' => '3', 'cvssV4_0' => '4'] as $key => $ver) {
+            foreach ($buckets as $m) {
+                if (!empty($m[$key])) {
+                    $c = $m[$key];
+                    $v->addCvss($ver, $this->toFloat($c['baseScore'] ?? null),
+                        (string) ($c['vectorString'] ?? ''), (string) ($c['baseSeverity'] ?? ''));
+                }
+            }
+        }
     }
 }
 
@@ -1471,7 +1558,7 @@ final class OsvSource extends VulnSource
         if ($cveId === '') {
             $cveId = $fallbackId !== '' ? $fallbackId : (string) $d['id'];
         }
-        return new Vulnerability(
+        $v = new Vulnerability(
             $cveId,
             (string) ($d['summary'] ?? ($d['details'] ?? '')),
             null,
@@ -1480,6 +1567,13 @@ final class OsvSource extends VulnSource
             $this->name(),
             $this->versionRanges($d)
         );
+        // Record every CVSS version OSV provides (each is a vector string).
+        foreach (['CVSS_V2' => '2', 'CVSS_V3' => '3', 'CVSS_V4' => '4'] as $type => $ver) {
+            if (!empty($vectors[$type])) {
+                $v->addCvss($ver, null, $vectors[$type], '');
+            }
+        }
+        return $v;
     }
 
     /** @return VersionRange[] */
@@ -2524,6 +2618,12 @@ final class Merger
             $cur->epss           = $cur->epss ?? $v->epss;
             $cur->epssPercentile = $cur->epssPercentile ?? $v->epssPercentile;
             $cur->kev            = $cur->kev || $v->kev;
+            // Union per-version CVSS, preferring entries that carry a vector.
+            foreach ($v->cvss as $ver => $entry) {
+                if (!isset($cur->cvss[$ver]) || ($cur->cvss[$ver]['vector'] === '' && $entry['vector'] !== '')) {
+                    $cur->cvss[$ver] = $entry;
+                }
+            }
         }
 
         foreach ($byCve as $key => $v) {
@@ -2590,7 +2690,18 @@ final class Renderer
             if ($v->versionChecked) {
                 $out .= self::row('Status', self::status($v));
             }
-            $out .= self::row('Vector',      $v->vector !== '' ? $v->vector : '—');
+            if ($v->cvss) {
+                foreach (['4', '3', '2'] as $ver) {
+                    if (!isset($v->cvss[$ver])) {
+                        continue;
+                    }
+                    $c     = $v->cvss[$ver];
+                    $score = $c['score'] !== null ? rtrim(rtrim(number_format($c['score'], 1, '.', ''), '0'), '.') : '—';
+                    $out  .= self::row('CVSS v' . $ver, trim($score . ' ' . $c['status'] . '  ' . ($c['vector'] !== '' ? $c['vector'] : '—')));
+                }
+            } else {
+                $out .= self::row('Vector', $v->vector !== '' ? $v->vector : '—');
+            }
             if ($v->versions) {
                 $lines = array_map(static fn (VersionRange $r) => $r->format(), $v->versions);
                 $shown = array_slice($lines, 0, 6);
