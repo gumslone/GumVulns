@@ -1975,6 +1975,105 @@ final class VulnCheckSource extends VulnSource
     }
 }
 
+/**
+ * search_vulns (search-vulns.com) — an aggregator API that matches by product /
+ * version / CPE / purl / CVE and returns CVSS, EPSS, exploits and KEV.
+ * Requires SEARCH_VULNS_API_KEY; base overridable via SEARCH_VULNS_URL.
+ */
+final class SearchVulnsSource extends VulnSource
+{
+    public function id(): string   { return 'search-vulns'; }
+    public function name(): string { return 'search_vulns'; }
+
+    public function isEnabled(): bool
+    {
+        $k = getenv('SEARCH_VULNS_API_KEY');
+        return $k !== false && $k !== '';
+    }
+
+    public function buildRequest(Query $q): ?HttpRequest
+    {
+        $query = $this->queryString($q);
+        if ($query === '') {
+            return null;
+        }
+        $base = getenv('SEARCH_VULNS_URL');
+        $base = ($base !== false && $base !== '') ? rtrim($base, '/') : 'https://search-vulns.com/api';
+        return new HttpRequest(
+            $base . '/search-vulns?query=' . rawurlencode($query),
+            'GET',
+            ['Accept: application/json', 'API-Key: ' . (string) getenv('SEARCH_VULNS_API_KEY')]
+        );
+    }
+
+    /** Turn the query into search_vulns' free-text "query" (product/CPE/purl/CVE). */
+    private function queryString(Query $q): string
+    {
+        if ($q->purl !== null) {
+            return $q->purl['raw'];
+        }
+        if ($q->type === QueryType::Cpe && $q->cpe) {
+            $parts = array_filter(
+                [$q->cpe->vendor, $q->cpe->product, $q->cpe->hasVersion() ? $q->cpe->version : ''],
+                static fn ($p) => $p !== '' && $p !== '*'
+            );
+            return implode(' ', $parts);
+        }
+        return $q->type === QueryType::CveId ? strtoupper($q->raw) : $q->raw;
+    }
+
+    public function parse(HttpResponse $resp, Query $q): array
+    {
+        if (!$resp->ok()) {
+            return [];
+        }
+        $out = [];
+        foreach ($this->get($this->json($resp->body), 'vulns', []) ?? [] as $vid => $vd) {
+            if (!is_array($vd)) {
+                continue;
+            }
+            // Prefer a CVE id (the key, or one of the aliases).
+            $cveId = stripos((string) $vid, 'CVE-') === 0 ? (string) $vid : '';
+            if ($cveId === '') {
+                foreach (array_keys($this->get($vd, 'aliases', []) ?? []) as $alias) {
+                    if (stripos((string) $alias, 'CVE-') === 0) {
+                        $cveId = (string) $alias;
+                        break;
+                    }
+                }
+            }
+            $cvss   = $this->get($vd, 'severity.CVSS', []) ?? [];
+            $score  = $this->toFloat($cvss['score'] ?? null);
+            $vector = (string) ($cvss['vector'] ?? '');
+
+            $v = new Vulnerability(
+                $cveId !== '' ? $cveId : (string) $vid,
+                (string) ($vd['description'] ?? ''),
+                $score,
+                '',
+                $vector,
+                $this->name()
+            );
+            if ($vector !== '' || $score !== null) {
+                $ver = isset($cvss['version']) ? explode('.', (string) $cvss['version'])[0] : (Cvss::version($vector) ?? '');
+                $v->addCvss($ver, $score, $vector, '');
+            }
+            $epss = $this->toFloat($this->get($vd, 'severity.EPSS.score', null));
+            if ($epss !== null) {
+                $v->epss = $epss;
+            }
+            if (!empty($vd['kev'])) {
+                $v->kev = true;
+            }
+            foreach (array_slice($this->get($vd, 'exploits', []) ?? [], 0, 15) as $url) {
+                $v->exploits[] = ['source' => 'search_vulns', 'url' => (string) $url];
+            }
+            $out[] = $v;
+        }
+        return $out;
+    }
+}
+
 /** EUVD — the EU Vulnerability Database (ENISA). JSON search API. */
 final class EuvdSource extends VulnSource
 {
@@ -2897,6 +2996,7 @@ function gumvulns_sources(): array
         new CveDetailsSource(),
         new VulnersSource(),
         new VulnCheckSource(),
+        new SearchVulnsSource(),
     ];
 }
 
@@ -3462,7 +3562,7 @@ GitHub links (commit -> OSV.dev; owner/repo/tag -> CPE sources):
   php gumvulns.php https://github.com/owner/repo/commit/<sha>
 
 Optional API keys (environment variables):
-  NVD_API_KEY, GITHUB_TOKEN, VULNERS_API_KEY, VULNCHECK_API_KEY
+  NVD_API_KEY, GITHUB_TOKEN, VULNERS_API_KEY, VULNCHECK_API_KEY, SEARCH_VULNS_API_KEY
   CVEDETAILS_COOKIE   browser cookie to get CVE Details past Cloudflare
 
 TXT;

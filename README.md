@@ -202,6 +202,7 @@ understands:
 | Ubuntu | `cves.json?package=<product>` |
 | GitHub Advisory | `affects=<package>` (+ `ecosystem=` from a purl's type) |
 | Vulners | Lucene `affectedSoftware.name` |
+| search_vulns | `search-vulns?query=<vendor product version / purl / cpe>` |
 | OSV.dev | the purl / package (purl mode) or commit (GitHub commit) |
 
 **Phase 2 — cross-reference.** The CVEs discovered in phase 1 are then looked up
@@ -348,6 +349,7 @@ carry a vector.
 | CVE Details (HTML scrape) | cookie, see below | ✅ | — | phase 2 | — |
 | Vulners | `VULNERS_API_KEY` | ✅ | ✅ | ✅ | — |
 | VulnCheck | `VULNCHECK_API_KEY` | ✅ | — | phase 2 | — |
+| search_vulns (search-vulns.com) | `SEARCH_VULNS_API_KEY` | ✅ | ✅ | ✅ | — |
 | Exploit/PoC indicators | — | enrichment (all modes) | | | |
 | endoflife.date | — | EOL status (with version) | | | |
 
@@ -367,7 +369,13 @@ export NVD_API_KEY=...        # strongly recommended — NVD throttles hard with
 export GITHUB_TOKEN=...
 export VULNERS_API_KEY=...
 export VULNCHECK_API_KEY=...
+export SEARCH_VULNS_API_KEY=...   # search-vulns.com (self-host base: SEARCH_VULNS_URL)
 ```
+
+[search_vulns](https://search-vulns.com) is itself an aggregator: one call by
+product / version / CPE / purl / CVE returns CVSS, EPSS, exploits and KEV, which
+GumVulns merges in by CVE id. Point at a self-hosted instance with
+`SEARCH_VULNS_URL`.
 
 Without `NVD_API_KEY`, NVD's API is rate-limited and often slow, so GumVulns
 gives NVD a longer per-request timeout and, for the CPE "Title"/known-platform

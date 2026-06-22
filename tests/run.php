@@ -247,6 +247,29 @@ $out = $shodan->parse(resp($shJson), new Query(QueryType::CveId, 'CVE-2021-44228
 eq($out[0]->score, 10.0, 'shodan score');
 ok($out[0]->kev, 'shodan sets KEV flag');
 
+// search_vulns (aggregator: CVSS + EPSS + exploits + KEV under vulns{})
+$sv = new SearchVulnsSource();
+$svJson = json_encode(['vulns' => [
+    'CVE-2021-44228' => [
+        'id' => 'CVE-2021-44228',
+        'description' => 'Log4Shell',
+        'aliases' => ['CVE-2021-44228' => 'https://nvd.nist.gov/vuln/detail/CVE-2021-44228'],
+        'severity' => [
+            'CVSS' => ['score' => '10.0', 'type' => 'CVSS', 'vector' => 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H', 'version' => '3.1'],
+            'EPSS' => ['score' => '0.99', 'type' => 'EPSS'],
+        ],
+        'exploits' => ['https://github.com/x/poc'],
+        'kev' => ['https://www.cisa.gov/...'],
+    ],
+]]);
+$out = $sv->parse(resp($svJson), new Query(QueryType::Cpe, 'x', Cpe::parse('apache:log4j:2.14.1')));
+eq($out[0]->cveId, 'CVE-2021-44228', 'search_vulns cve id');
+eq($out[0]->score, 10.0, 'search_vulns score');
+eq($out[0]->cvss['3']['vector'], 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H', 'search_vulns cvss3 vector');
+eq($out[0]->epss, 0.99, 'search_vulns epss');
+ok($out[0]->kev, 'search_vulns kev flag');
+eq(count($out[0]->exploits), 1, 'search_vulns exploit captured');
+
 // EUVD (alias filter in CVE mode + raw product range)
 $euvd = new EuvdSource();
 $euvdJson = json_encode(['items' => [
